@@ -129,8 +129,8 @@ class _QuestionnaireScreenState extends State<QuestionnaireScreen> {
         context,
       ).showSnackBar(const SnackBar(content: Text("Assessment completed!")));
 
-      // ✅ 5) Pop back to Home so CareerSetupPanel's .then(...) can refresh
-      if (Navigator.canPop(context)) Navigator.pop(context);
+      // Tell the panel we finished NCAE successfully
+      if (Navigator.canPop(context)) Navigator.pop(context, true);
     } catch (e) {
       setState(() => _isSaving = false);
       if (!mounted) return;

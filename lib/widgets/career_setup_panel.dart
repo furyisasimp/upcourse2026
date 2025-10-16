@@ -5,8 +5,7 @@ import 'package:career_roadmap/screens/riasec_test_screen.dart';
 import 'package:career_roadmap/screens/questionnaire_screen.dart';
 
 class CareerSetupPanel extends StatefulWidget {
-  /// Called when the panel’s work is complete (both RIASEC & NCAE done),
-  /// or immediately after “Finalize / Save Path” succeeds.
+  /// Called when both RIASEC & NCAE are complete, or right after finalize succeeds.
   final VoidCallback? onCompleted;
 
   const CareerSetupPanel({Key? key, this.onCompleted}) : super(key: key);
@@ -16,20 +15,36 @@ class CareerSetupPanel extends StatefulWidget {
 }
 
 class _CareerSetupPanelState extends State<CareerSetupPanel> {
-  bool _loading = true;
+  bool _loading = true; // page spinner
+  bool _finalizing = false; // submit button spinner
   bool _riasecDone = false;
   bool _ncaeDone = false;
-  Map<String, dynamic>? _preview; // strand/course preview if you show it
+  Map<String, dynamic>? _preview; // optional strand/course preview
   String? _error;
 
+  // ---------- lifecycle ----------
   @override
   void initState() {
     super.initState();
     _refreshFlags();
   }
 
+  void _safeSetState(VoidCallback fn) {
+    if (!mounted) return;
+    setState(fn);
+  }
+
+  void _notifyCompleted() {
+    final cb = widget.onCompleted;
+    if (cb == null) return;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) cb();
+    });
+  }
+
+  // ---------- data ----------
   Future<void> _refreshFlags() async {
-    setState(() {
+    _safeSetState(() {
       _loading = true;
       _error = null;
     });
@@ -37,80 +52,71 @@ class _CareerSetupPanelState extends State<CareerSetupPanel> {
     try {
       final uid = SupabaseService.authUserId;
       if (uid == null) {
-        setState(() {
+        _safeSetState(() {
           _riasecDone = false;
           _ncaeDone = false;
+          _preview = null;
           _loading = false;
         });
         return;
       }
 
-      // Check if user has RIASEC result
+      // Check flags (guard after each await)
       final hasRiasec = await SupabaseService.userHasRiasecResult(uid);
-      // Check if user has NCAE result (either structured ncae_results or questionnaire_results)
+      if (!mounted) return;
       final hasNcae = await SupabaseService.userHasNcaeResult(uid);
+      if (!mounted) return;
 
-      setState(() {
+      Map<String, dynamic>? preview;
+      if (hasRiasec && hasNcae) {
+        try {
+          preview = await SupabaseService.previewLearningPath();
+        } catch (_) {
+          preview = null; // preview is optional
+        }
+        if (!mounted) return;
+      }
+
+      _safeSetState(() {
         _riasecDone = hasRiasec;
         _ncaeDone = hasNcae;
+        _preview = preview;
         _loading = false;
       });
 
-      if (_riasecDone && _ncaeDone) {
-        // Optional: load preview when both are present
-        try {
-          _preview = await SupabaseService.previewLearningPath();
-        } catch (_) {
-          /* ignore preview errors */
-        }
-        _notifyCompleted(); // tell HomeScreen so it can hide the panel
-      }
+      if (hasRiasec && hasNcae) _notifyCompleted();
     } catch (e) {
-      setState(() {
+      _safeSetState(() {
         _error = 'Failed to load status: $e';
         _loading = false;
       });
     }
   }
 
-  void _notifyCompleted() {
-    // Fire after the current frame to avoid setState-order issues
-    if (widget.onCompleted != null) {
-      WidgetsBinding.instance.addPostFrameCallback((_) {
-        widget.onCompleted!.call();
-      });
-    }
-  }
+  // Called by buttons after a flow completes successfully
+  void _markRiasecDone() => _safeSetState(() => _riasecDone = true);
+  void _markNcaeDone() => _safeSetState(() => _ncaeDone = true);
 
-  // Call this right after you save a RIASEC result from inside this panel
-  Future<void> _markRiasecDone() async {
-    setState(() => _riasecDone = true);
-    if (_riasecDone && _ncaeDone) _notifyCompleted();
-  }
-
-  // Call this right after you save an NCAE result from inside this panel
-  Future<void> _markNcaeDone() async {
-    setState(() => _ncaeDone = true);
-    if (_riasecDone && _ncaeDone) _notifyCompleted();
-  }
-
-  // When user presses "Finalize / Save Path"
+  // Finalize (writes user_learning_path via RPC) – guarded and with spinner
   Future<void> _finalize() async {
-    setState(() {
-      _loading = true;
+    if (_finalizing) return;
+    _safeSetState(() {
+      _finalizing = true;
       _error = null;
     });
+
     try {
       await SupabaseService.finalizeLearningPath();
-      // After finalize, also notify parent to hide the panel
+      if (!mounted) return;
       _notifyCompleted();
     } catch (e) {
-      setState(() => _error = 'Failed to finalize: $e');
+      _safeSetState(() => _error = 'Failed to finalize: $e');
     } finally {
-      setState(() => _loading = false);
+      _safeSetState(() => _finalizing = false);
     }
   }
 
+  // ---------- UI ----------
   @override
   Widget build(BuildContext context) {
     if (_loading) {
@@ -120,6 +126,8 @@ class _CareerSetupPanelState extends State<CareerSetupPanel> {
         child: const Center(child: CircularProgressIndicator()),
       );
     }
+
+    final bothDone = _riasecDone && _ncaeDone;
 
     return Container(
       padding: const EdgeInsets.all(16),
@@ -151,9 +159,12 @@ class _CareerSetupPanelState extends State<CareerSetupPanel> {
                 context,
                 MaterialPageRoute(builder: (_) => const RiasecTestScreen()),
               );
+              if (!mounted) return;
               if (finished == true) {
-                await _markRiasecDone();
+                _markRiasecDone();
                 await _refreshFlags();
+              } else {
+                await _refreshFlags(); // still refresh in case data changed
               }
             },
           ),
@@ -166,8 +177,11 @@ class _CareerSetupPanelState extends State<CareerSetupPanel> {
                 context,
                 MaterialPageRoute(builder: (_) => const QuestionnaireScreen()),
               );
+              if (!mounted) return;
               if (finished == true) {
-                await _markNcaeDone();
+                _markNcaeDone();
+                await _refreshFlags();
+              } else {
                 await _refreshFlags();
               }
             },
@@ -175,8 +189,7 @@ class _CareerSetupPanelState extends State<CareerSetupPanel> {
 
           const SizedBox(height: 12),
 
-          if (_riasecDone && _ncaeDone) ...[
-            // Optional small preview text
+          if (bothDone) ...[
             if (_preview != null)
               Padding(
                 padding: const EdgeInsets.only(bottom: 8),
@@ -189,9 +202,19 @@ class _CareerSetupPanelState extends State<CareerSetupPanel> {
             SizedBox(
               width: double.infinity,
               child: ElevatedButton.icon(
-                onPressed: _finalize,
-                icon: const Icon(Icons.check_circle_outline),
-                label: const Text('Finalize / Save Path'),
+                onPressed: _finalizing ? null : _finalize,
+                icon:
+                    _finalizing
+                        ? const SizedBox(
+                          width: 18,
+                          height: 18,
+                          child: CircularProgressIndicator(strokeWidth: 2),
+                        )
+                        : const Icon(Icons.check_circle_outline),
+                label: Text(
+                  _finalizing ? 'Saving…' : 'Finalize / Save Path',
+                  style: const TextStyle(fontFamily: 'Inter'),
+                ),
                 style: ElevatedButton.styleFrom(
                   padding: const EdgeInsets.symmetric(vertical: 14),
                 ),
@@ -199,7 +222,7 @@ class _CareerSetupPanelState extends State<CareerSetupPanel> {
             ),
           ] else
             const Text(
-              'Complete both tests to generate your recommended SHS strand and course.',
+              'Complete both tests to find out your recommended Academic Track and Course.',
               style: TextStyle(
                 fontFamily: 'Inter',
                 fontSize: 13,
@@ -230,6 +253,7 @@ class _CareerSetupPanelState extends State<CareerSetupPanel> {
   }) {
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 12),
+      margin: const EdgeInsets.only(bottom: 8),
       decoration: BoxDecoration(
         border: Border.all(
           color: done ? const Color(0xFFB6F2D3) : const Color(0xFFE6EDF5),

@@ -188,9 +188,22 @@ class ProfileDetailsScreenState extends State<ProfileDetailsScreen> {
     final String school = (_profileData?['school'] ?? 'N/A').toString();
     final String email = (SupabaseService.authEmail ?? 'N/A').toString();
 
-    // NEW: Strand & Course (from users table)
-    final String strand = (_profileData?['strand'] ?? '').toString().trim();
-    final String course = (_profileData?['course'] ?? '').toString().trim();
+    // NEW: Track & Course (from normalized service fields)
+    final String track =
+        (_profileData?['track_label'] ??
+                _profileData?['track_id'] ??
+                _profileData?['strand'] ??
+                '')
+            .toString()
+            .trim();
+
+    final String course =
+        (_profileData?['course_label'] ??
+                _profileData?['course'] ??
+                (_profileData?['courses']?['name']) ??
+                '')
+            .toString()
+            .trim();
 
     final String fullName = [
       firstName,
@@ -250,7 +263,7 @@ class ProfileDetailsScreenState extends State<ProfileDetailsScreen> {
                       _ChipsRow(
                         gradeLevel: gradeLevel,
                         school: school,
-                        strand: strand,
+                        track: track,
                         course: course,
                       ),
                     ],
@@ -279,7 +292,7 @@ class ProfileDetailsScreenState extends State<ProfileDetailsScreen> {
                             _ChipsRow(
                               gradeLevel: gradeLevel,
                               school: school,
-                              strand: strand,
+                              track: track,
                               course: course,
                             ),
                           ],
@@ -310,8 +323,8 @@ class ProfileDetailsScreenState extends State<ProfileDetailsScreen> {
             const Divider(height: 1),
             const SizedBox(height: 6),
 
-            // NEW: Strand & Course lines
-            _infoRow('Senior High Strand', strand.ifEmpty('—')),
+            // NEW: Track & Course lines
+            _infoRow('Track', track.ifEmpty('—')),
             _infoRow('Course', course.ifEmpty('—')),
           ],
         ),
@@ -689,14 +702,14 @@ class _ChipsRow extends StatelessWidget {
   final String gradeLevel;
   final String school;
 
-  // NEW: show strand & course chips if present
-  final String? strand;
+  // NEW: show track & course chips if present
+  final String? track;
   final String? course;
 
   const _ChipsRow({
     required this.gradeLevel,
     required this.school,
-    this.strand,
+    this.track,
     this.course,
   });
 
@@ -705,7 +718,7 @@ class _ChipsRow extends StatelessWidget {
     final chips = <Widget>[
       if (gradeLevel.isNotEmpty) _chip('Grade $gradeLevel'),
       if (school.trim().isNotEmpty && school != 'N/A') _chip(school),
-      if ((strand ?? '').trim().isNotEmpty) _chip('Strand: ${strand!.trim()}'),
+      if ((track ?? '').trim().isNotEmpty) _chip('Track: ${track!.trim()}'),
       if ((course ?? '').trim().isNotEmpty) _chip(course!.trim()),
     ];
 
@@ -724,6 +737,9 @@ class _ChipsRow extends StatelessWidget {
       ),
       child: Text(
         text,
+        maxLines: 2,
+        softWrap: true,
+        overflow: TextOverflow.ellipsis,
         style: const TextStyle(
           fontFamily: 'Inter',
           fontSize: 12,

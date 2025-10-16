@@ -30,7 +30,6 @@ class QuizSpec {
 }
 
 // ==== START: Exploration models (Strand / Pathway) ====
-/// Lightweight link object used inside Strand/Pathway rows.
 class SourceLink {
   final String name;
   final String url;
@@ -72,7 +71,6 @@ class Strand {
     required this.sources,
   });
 
-  /// Build from a Supabase row (handles either `code` or `strand_id`).
   factory Strand.fromRow(Map<String, dynamic> r) => Strand(
     code: (r['code'] ?? r['strand_id'] ?? '').toString(),
     name: (r['name'] ?? '').toString(),
@@ -142,7 +140,6 @@ class Pathway {
   );
 }
 
-/// Bundle a pathway with its "match" label (e.g., High match).
 class PathwayMatch {
   final Pathway pathway;
   final String matchLabel;
@@ -165,14 +162,12 @@ class SupabaseService {
     if (res.user != null) {
       final uid = res.user!.id;
 
-      // Create user profile
       await supa.from('users').upsert({
         'supabase_id': uid,
         'email': email,
         'created_at': DateTime.now().toIso8601String(),
       });
 
-      // ✅ Seed default skill_progress (avoid duplicates with onConflict)
       await supa.from('skill_progress').upsert([
         {
           'user_id': uid,
@@ -194,7 +189,6 @@ class SupabaseService {
         },
       ], onConflict: 'user_id,module_id');
 
-      // ✅ Seed default quiz_progress (avoid duplicates with onConflict)
       await supa.from('quiz_progress').upsert([
         {
           'user_id': uid,
@@ -235,11 +229,71 @@ class SupabaseService {
     final uid = authUserId;
     if (uid == null) return null;
 
-    return await supa
-        .from('users')
-        .select()
-        .eq('supabase_id', uid)
-        .maybeSingle();
+    // Pull exactly what the Profile screen needs + embedded labels.
+    final row =
+        await supa
+            .from('users')
+            .select(
+              'first_name,middle_name,last_name,grade_level,school,profile_picture,'
+              'strand,course,track_id,course_id,'
+              'tracks:track_id(track_name),' // embedded track label
+              'courses:course_id(name)', // embedded course label
+            )
+            .eq('supabase_id', uid)
+            .maybeSingle();
+
+    if (row == null) return null;
+
+    // Normalise + make safe for the UI (everything as String),
+    // and compute robust display labels with fallbacks.
+    final m = Map<String, dynamic>.from(row);
+
+    // Helper: embedded object can be a Map or a 1-row List depending on client.
+    String _pluckEmbedded(Map data, String relKey, String field) {
+      final rel = data[relKey];
+      if (rel is Map && rel[field] != null) return rel[field].toString();
+      if (rel is List && rel.isNotEmpty && rel.first is Map) {
+        final v = (rel.first as Map)[field];
+        if (v != null) return v.toString();
+      }
+      return '';
+    }
+
+    // Prefer embedded human names…
+    final trackFromRel = _pluckEmbedded(m, 'tracks', 'track_name').trim();
+    final courseFromRel = _pluckEmbedded(m, 'courses', 'name').trim();
+
+    // …then fall back to IDs / legacy text if needed.
+    final trackFallback =
+        (m['track_id']?.toString().trim().isNotEmpty ?? false)
+            ? m['track_id'].toString().trim()
+            : (m['strand']?.toString().trim() ?? '');
+
+    final courseFallback = (m['course']?.toString().trim() ?? '');
+
+    m['track_label'] = (trackFromRel.isNotEmpty ? trackFromRel : trackFallback);
+    m['course_label'] =
+        (courseFromRel.isNotEmpty ? courseFromRel : courseFallback);
+
+    // Ensure all string fields the UI reads exist (avoids null noise downstream).
+    for (final k in const [
+      'first_name',
+      'middle_name',
+      'last_name',
+      'grade_level',
+      'school',
+      'profile_picture',
+      'strand',
+      'course',
+      'track_id',
+      'course_id',
+      'track_label',
+      'course_label',
+    ]) {
+      m[k] = (m[k] ?? '').toString();
+    }
+
+    return m;
   }
 
   static Future<void> upsertMyProfile(Map<String, dynamic> patch) async {
@@ -251,18 +305,14 @@ class SupabaseService {
   }
 
   // ==== START: Exploration fetchers (user strand, strands, courses/pathways) ====
-  /// Returns the user's strand/course code using whatever column naming exists.
-  /// Tries several common column-name pairs and gracefully skips ones that
-  /// don't exist (avoids Postgrest 400 "column does not exist").
   static Future<String?> getUserStrandOrCourseCode() async {
     final uid = authUserId;
     if (uid == null) return null;
 
-    // Try these column pairs in order
     final List<List<String>> columnSets = [
-      ['strand_code', 'course_code'], // original attempt
-      ['strand_id', 'course_id'], // common alternative
-      ['strand', 'course'], // generic
+      ['strand_code', 'course_code'],
+      ['strand_id', 'course_id'],
+      ['strand', 'course'],
       ['shs_strand_code', 'course_code'],
       ['shs_strand', 'course_code'],
     ];
@@ -275,27 +325,18 @@ class SupabaseService {
                 .select(cols.join(','))
                 .eq('supabase_id', uid)
                 .maybeSingle();
-
         if (row == null) continue;
-
-        // Return the first non-empty value among the tried columns
         for (final c in cols) {
           final v = row[c];
-          if (v is String && v.trim().isNotEmpty) {
-            return v.trim();
-          }
+          if (v is String && v.trim().isNotEmpty) return v.trim();
         }
       } catch (_) {
-        // Likely referenced a column that doesn't exist → try next set
         continue;
       }
     }
-
     return null;
   }
 
-  /// Return SHS strands for Exploration cards.
-  /// Uses the view `v_strands_shs` (recommended), which exposes `strand_id` plus metadata.
   static Future<List<Strand>> listStrands({
     List<String> codes = const ['STEM', 'ABM', 'GAS', 'TECHPRO'],
   }) async {
@@ -307,7 +348,6 @@ class SupabaseService {
     } else if (codes.length == 1) {
       rows = await sel.eq('strand_id', codes.first);
     } else {
-      // OR expression: strand_id.eq.STEM,strand_id.eq.ABM,...
       final orExpr = codes.map((c) => 'strand_id.eq.$c').join(',');
       rows = await sel.or(orExpr);
     }
@@ -318,9 +358,6 @@ class SupabaseService {
         .toList();
   }
 
-  /// Get a single strand by code (e.g., 'STEM', 'ABM', 'GAS', 'TECHPRO').
-  /// Tries the `v_strands_shs` view first (filtering by `strand_id`), then falls
-  /// back to the `strands` table (filtering by `code`) if needed.
   static Future<Strand?> getStrandByCode(String code) async {
     try {
       final viewRow =
@@ -332,18 +369,13 @@ class SupabaseService {
       if (viewRow != null) {
         return Strand.fromRow(Map<String, dynamic>.from(viewRow));
       }
-    } catch (_) {
-      // Fall through to table lookup
-    }
-
+    } catch (_) {}
     final tblRow =
         await supa.from('strands').select('*').eq('code', code).maybeSingle();
     if (tblRow == null) return null;
     return Strand.fromRow(Map<String, dynamic>.from(tblRow));
   }
 
-  /// Fetch "courses" (college pathways) tied to a strand code (text), e.g. 'STEM'.
-  /// Works with your public.courses (strand_id TEXT, riasec_primary ENUM).
   static Future<List<Map<String, dynamic>>> listCoursesForStrandCode(
     String strandCode,
   ) async {
@@ -358,7 +390,6 @@ class SupabaseService {
     return (rows as List?)?.cast<Map<String, dynamic>>() ?? const [];
   }
 
-  /// (For future when you add `pathways` + `strand_pathways` mapping)
   static Future<List<PathwayMatch>> listPathwaysForStrand(
     String strandCode,
   ) async {
@@ -442,7 +473,7 @@ class SupabaseService {
     final decoded = json.decode(utf8.decode(data));
     final list = (decoded as List).cast<Map<String, dynamic>>();
 
-    list.shuffle(Random()); // ✅ Shuffle questions each time
+    list.shuffle(Random());
     return list;
   }
 
@@ -543,7 +574,7 @@ class SupabaseService {
       'lessons_completed': lessonsCompleted,
       'lessons_total': lessonsTotal,
       'updated_at': DateTime.now().toIso8601String(),
-    }, onConflict: 'user_id,module_id'); // ✅ no duplicates
+    }, onConflict: 'user_id,module_id');
   }
 
   static Future<List<Map<String, dynamic>>> getSkillProgress() async {
@@ -561,11 +592,8 @@ class SupabaseService {
 
   static String _coerceQuizStatus(String? status) {
     final s = (status ?? '').trim().toLowerCase();
-
-    // Already valid?
     if (_dbAllowedQuizStatuses.contains(s)) return s;
 
-    // Common aliases → in_progress
     switch (s) {
       case 'unlocked':
       case 'start':
@@ -574,17 +602,13 @@ class SupabaseService {
       case 'progress':
       case 'ongoing':
         return 'in_progress';
-
       case 'done':
       case 'finished':
       case 'complete':
         return 'completed';
-
       case 'lock':
         return 'locked';
-
       default:
-        // safest default when enabling play
         return 'in_progress';
     }
   }
@@ -620,16 +644,12 @@ class SupabaseService {
   }
 
   // ---------- LOAD LESSONS ----------
-  // ---- PATH HELPERS -------------------------------------------------
-
-  // Make ids match file naming: lower, underscores, strip ".json" and extra punctuation
   static String _normalizeId(String s) {
     final noExt = s.trim().toLowerCase().replaceAll(RegExp(r'\.json$'), '');
     final squashed = noExt.replaceAll(RegExp(r'[^a-z0-9/]+'), '_');
     return squashed.replaceAll(RegExp(r'_+'), '_');
   }
 
-  // Debug: print what's inside adaptive-quizzes (and an optional folder)
   static Future<void> debugDumpAdaptive({String folder = ''}) async {
     const bucket = 'adaptive-quizzes';
     final s = supa.storage.from(bucket);
@@ -682,7 +702,6 @@ class SupabaseService {
       }
     }
 
-    // Directory probes for fast diagnosis
     Future<List<String>> _ls(String path) async {
       try {
         final list = await s.list(path: path);
@@ -739,7 +758,6 @@ class SupabaseService {
     }
   }
 
-  // Helper: discover top-level folders in a bucket
   static Future<List<String>> _topLevelFolders(String bucket) async {
     try {
       final entries = await supa.storage.from(bucket).list(path: '');
@@ -765,7 +783,6 @@ class SupabaseService {
     final snake = _normalizeId(moduleId);
     final jsonFile = '$snake.json';
 
-    // --- Build candidate JSON locations (user folder + all top-level + root)
     final candidates = <String>[
       if (code != null && code.isNotEmpty) '$code/$jsonFile',
       if (code != null && code.isNotEmpty) '$code/$snake/module.json',
@@ -773,11 +790,10 @@ class SupabaseService {
     ];
 
     for (final f in await _topLevelFolders(bucket)) {
-      candidates.add('$f/$jsonFile'); // flat json in folder
-      candidates.add('$f/$snake/module.json'); // nested module.json
+      candidates.add('$f/$jsonFile');
+      candidates.add('$f/$snake/module.json');
     }
 
-    // Try JSON-first mode
     try {
       final bytes = await _downloadFirstFound(
         bucket: bucket,
@@ -785,25 +801,21 @@ class SupabaseService {
       );
       final decoded = json.decode(utf8.decode(bytes));
 
-      // Accept either { "lessons": [...] } or a raw [ ... ]
       final List<dynamic> rawLessons;
       if (decoded is Map<String, dynamic> && decoded['lessons'] is List) {
         rawLessons = decoded['lessons'] as List<dynamic>;
       } else if (decoded is List) {
         rawLessons = decoded;
       } else {
-        // If JSON exists but structure is unexpected, just return empty
         return [];
       }
 
-      // For each lesson, if it has content_url like storage://..., fetch it
       final out = <Map<String, dynamic>>[];
       for (final e in rawLessons) {
         final m = Map<String, dynamic>.from(e as Map);
         final url = (m['content_url'] ?? '').toString().trim();
 
         if (url.startsWith('storage://')) {
-          // content_url may say "skills-module" in older files — normalize to skill-modules
           var (bkt, pth) = _parseStorageUrl(url);
           if (bkt == 'skills-module') bkt = 'skill-modules'; // legacy typo
           final txt = await _tryDownloadText(bkt, pth);
@@ -815,11 +827,8 @@ class SupabaseService {
       }
 
       return out;
-    } catch (_) {
-      // Fall through to folder mode
-    }
+    } catch (_) {}
 
-    // --- FOLDER MODE: <ANY_CODE>/<moduleId>/L*.md (no JSON at all)
     final folders = <String>[
       if (code != null && code.isNotEmpty) code,
       ...await _topLevelFolders(bucket),
@@ -836,7 +845,7 @@ class SupabaseService {
                   (n) =>
                       n.toLowerCase().endsWith('.md') &&
                       n.toLowerCase().startsWith('l'),
-                ) // L1.md, L2.md, ...
+                )
                 .toList()
               ..sort();
 
@@ -851,12 +860,9 @@ class SupabaseService {
           });
         }
         return lessons;
-      } catch (_) {
-        // try next folder
-      }
+      } catch (_) {}
     }
 
-    // Nothing found anywhere
     return [];
   }
 
@@ -864,18 +870,15 @@ class SupabaseService {
   static Future<List<Map<String, dynamic>>> loadQuiz(String quizId) async {
     const bucket = 'adaptive-quizzes';
 
-    // Normalize & split possible folder prefix
     final raw = quizId.trim();
     final hasFolder = raw.contains('/');
     final parts = raw.split('/');
     final baseId = hasFolder ? parts.last : raw;
 
-    // normalize basename like your filenames
-    final normBase = _normalizeId(baseId); // lower + underscores
+    final normBase = _normalizeId(baseId);
     final fileExact = '$normBase.json';
     final fileLower = fileExact.toLowerCase();
 
-    // Build candidate storage paths to try (in order)
     final candidates = <String>[];
 
     if (hasFolder) {
@@ -885,14 +888,13 @@ class SupabaseService {
         candidates.add('$f/$fileLower');
       }
     } else {
-      final code = await getUserStrandOrCourseCode(); // e.g., GAS / BSA
+      final code = await getUserStrandOrCourseCode();
       if (code != null && code.isNotEmpty) {
         for (final f in {code, code.toUpperCase(), code.toLowerCase()}) {
           candidates.add('$f/$fileExact');
           candidates.add('$f/$fileLower');
         }
       }
-      // root fallbacks
       candidates.add(fileExact);
       candidates.add(fileLower);
     }
@@ -904,7 +906,6 @@ class SupabaseService {
       );
       final decoded = json.decode(utf8.decode(bytes));
 
-      // --- Legacy: direct `questions: []` or a raw list
       if (decoded is Map<String, dynamic> && decoded['questions'] is List) {
         return (decoded['questions'] as List)
             .map((e) => Map<String, dynamic>.from(e as Map))
@@ -914,7 +915,6 @@ class SupabaseService {
         return decoded.map((e) => Map<String, dynamic>.from(e as Map)).toList();
       }
 
-      // --- Adaptive format: pools + tos/selection ---
       if (decoded is Map<String, dynamic> && decoded['pools'] is Map) {
         final pools = Map<String, dynamic>.from(decoded['pools']);
 
@@ -941,19 +941,14 @@ class SupabaseService {
 
         if (decoded['tos'] is Map) {
           final tos = Map<String, dynamic>.from(decoded['tos']);
-          counts['easy'] =
-              (tos['easy'] is num) ? (tos['easy'] as num).toInt() : 0;
-          counts['medium'] =
-              (tos['medium'] is num) ? (tos['medium'] as num).toInt() : 0;
-          counts['hard'] =
-              (tos['hard'] is num) ? (tos['hard'] as num).toInt() : 0;
+          counts['easy'] = (tos['easy'] ?? 0) as int;
+          counts['medium'] = (tos['medium'] ?? 0) as int;
+          counts['hard'] = (tos['hard'] ?? 0) as int;
 
-          // Cap by availability
           counts['easy'] = counts['easy']!.clamp(0, easy.length);
           counts['medium'] = counts['medium']!.clamp(0, medium.length);
           counts['hard'] = counts['hard']!.clamp(0, hard.length);
 
-          // Adjust to exactly `total`
           int sum = counts.values.fold(0, (a, b) => a + b);
           while (sum > total) {
             for (final k in ['hard', 'medium', 'easy']) {
@@ -977,13 +972,11 @@ class SupabaseService {
             sum++;
           }
         } else {
-          // No TOS → random from all pools up to total
           final all = <Map<String, dynamic>>[...easy, ...medium, ...hard]
             ..shuffle();
           return all.take(total.clamp(0, all.length)).toList();
         }
 
-        // Picker with shuffle
         List<T> pick<T>(List<T> list, int n) {
           if (n <= 0 || list.isEmpty) return [];
           final copy = List<T>.of(list)..shuffle();
@@ -996,7 +989,6 @@ class SupabaseService {
           ...pick(hard, counts['hard']!),
         ];
 
-        // Final trim / top-up
         if (selected.length < total) {
           final used = selected.map((q) => q['id'] ?? q['question']).toSet();
           final leftovers = <Map<String, dynamic>>[
@@ -1018,13 +1010,11 @@ class SupabaseService {
     } catch (e) {
       // ignore: avoid_print
       print('Error loading quiz $quizId from $bucket: $e');
-      rethrow; // let UI show the nice error card
+      rethrow;
     }
   }
 
   // ---------- STORAGE (generic) ----------
-  /// Lists file *names* at `path` ('' = root) inside a bucket.
-  /// Used by QuizCategoriesScreen to discover quizzes like ABM.json, STEM.json.
   static Future<List<String>> listFiles({
     required String bucket,
     String path = '',
@@ -1057,7 +1047,6 @@ class SupabaseService {
     return supa.storage.from('avatars').getPublicUrl(path);
   }
 
-  // ✅ Dynamic list of PDFs
   static Future<List<FileObject>> listPdfFiles() async {
     return await supa.storage.from('my-study-guides').list(path: '');
   }
@@ -1066,7 +1055,6 @@ class SupabaseService {
     return supa.storage.from('my-study-guides').getPublicUrl(key);
   }
 
-  // ✅ Dynamic list of videos
   static Future<List<FileObject>> listVideoFiles() async {
     return await supa.storage.from('study-guide-videos').list(path: '');
   }
@@ -1075,8 +1063,6 @@ class SupabaseService {
     return supa.storage.from('study-guide-videos').getPublicUrl(key);
   }
 
-  /// Returns a URL you can `http.get`. Uses a **signed URL** first (works for
-  /// private and public buckets), falling back to a public URL if signing fails.
   static Future<String?> getFileUrl({
     required String bucket,
     required String path,
@@ -1098,14 +1084,13 @@ class SupabaseService {
     }
   }
 
-  // ---- QUIZ: BANK + TOS LOADER (always returns 10, supports fixed + weighted) ----
+  // ---- QUIZ: BANK + TOS LOADER ----
   static Future<List<Map<String, dynamic>>> fetchQuizWithTOS({
     required String quizId,
     String bucket = 'quizzes',
-    int? seed, // optional deterministic selection
-    int totalOverride = 10, // <- we always target 10; change here if needed
+    int? seed,
+    int totalOverride = 10,
   }) async {
-    // 1) Load the bank
     final bankBytes = await supa.storage.from(bucket).download('$quizId.json');
     final dynamic bankDecoded = json.decode(utf8.decode(bankBytes));
     final List<Map<String, dynamic>> bank =
@@ -1117,10 +1102,8 @@ class SupabaseService {
 
     if (bank.isEmpty) return [];
 
-    // Our final target is ALWAYS 10 (or fewer if the bank has <10).
     final int target = min(totalOverride, bank.length);
 
-    // 2) Try to load TOS (if missing, just return 10 random from bank)
     Map<String, dynamic>? specData;
     try {
       final tosBytes = await supa.storage
@@ -1128,13 +1111,11 @@ class SupabaseService {
           .download('${quizId}_tos.json');
       specData = json.decode(utf8.decode(tosBytes)) as Map<String, dynamic>;
     } catch (_) {
-      // No TOS → pick any 10 from the whole bank
       final rnd = seed == null ? Random() : Random(seed);
       final copy = List<Map<String, dynamic>>.of(bank)..shuffle(rnd);
       return copy.take(target).toList();
     }
 
-    // 3) Group bank by difficulty
     final Map<String, List<Map<String, dynamic>>> byDiff = {
       'easy': [],
       'medium': [],
@@ -1159,29 +1140,24 @@ class SupabaseService {
       return copy.take(cnt).toList();
     }
 
-    // 4) Detect weighted vs fixed spec
     final bool isWeighted =
         (specData['mode']?.toString().toLowerCase() == 'weighted') ||
         (specData.containsKey('weights'));
 
-    // We'll build 'counts' toward the final target (10)
     var counts = <String, int>{'easy': 0, 'medium': 0, 'hard': 0};
 
     if (!isWeighted) {
-      // ---- Fixed counts: {easy, medium, hard, total} ----
       counts['easy'] = (specData['easy'] ?? 0) as int;
       counts['medium'] = (specData['medium'] ?? 0) as int;
       counts['hard'] = (specData['hard'] ?? 0) as int;
 
-      // Cap by availability
       for (final k in counts.keys) {
         counts[k] = counts[k]!.clamp(0, byDiff[k]!.length);
       }
 
-      // If sum > target, trim fairly (reduce the biggest buckets first)
       int sum = counts.values.fold(0, (a, b) => a + b);
       while (sum > target) {
-        for (final k in ['easy', 'medium', 'hard']) {
+        for (final k in ['hard', 'medium', 'easy']) {
           if (counts[k]! > 0 && sum > target) {
             counts[k] = counts[k]! - 1;
             sum--;
@@ -1189,7 +1165,6 @@ class SupabaseService {
         }
       }
     } else {
-      // ---- Weighted mode ----
       final Map<String, dynamic> wRaw = Map<String, dynamic>.from(
         specData['weights'] ?? {},
       );
@@ -1241,13 +1216,11 @@ class SupabaseService {
                 : int.tryParse('${maxRaw['hard']}') ?? target,
       };
 
-      // Cap mins/maxes by availability
       for (final k in ['easy', 'medium', 'hard']) {
         minC[k] = min(minC[k]!, avail[k]!);
         maxC[k] = min(maxC[k]!, avail[k]!);
       }
 
-      // If sum(min) > target, reduce mins (prefer reducing hard -> medium -> easy)
       int sumMin = minC.values.fold(0, (a, b) => a + b);
       while (sumMin > target) {
         for (final k in ['hard', 'medium', 'easy']) {
@@ -1290,7 +1263,6 @@ class SupabaseService {
         return pool.last;
       }
 
-      // Fill remaining by weighted draws with capacity checks
       while (remaining > 0) {
         final cands =
             [
@@ -1305,14 +1277,12 @@ class SupabaseService {
       }
     }
 
-    // 5) Select questions per final counts
     var selected = <Map<String, dynamic>>[
       ...pick(byDiff['easy']!, counts['easy']!),
       ...pick(byDiff['medium']!, counts['medium']!),
       ...pick(byDiff['hard']!, counts['hard']!),
     ];
 
-    // 6) Top up / trim to the exact target (10)
     if (selected.length < target) {
       final used = selected.map((q) => q['id'] ?? q['text']).toSet();
       final leftover =
@@ -1339,8 +1309,6 @@ class SupabaseService {
   }
 
   // ---------- RIASEC TEST: LOADERS & SCORING ----------
-  /// Loads items.json from the 'riasec-test' bucket.
-  /// Returns: { items: List<Map>, scale_min: int, scale_max: int, likert_labels: List<String> }
   static Future<Map<String, dynamic>> loadRiasecItems({
     String bucket = 'riasec-test',
     String path = 'items.json',
@@ -1353,9 +1321,7 @@ class SupabaseService {
             .map((e) => Map<String, dynamic>.from(e))
             .toList();
 
-    if (shuffle) {
-      items.shuffle(Random());
-    }
+    if (shuffle) items.shuffle(Random());
 
     return {
       'items': items,
@@ -1373,10 +1339,9 @@ class SupabaseService {
     };
   }
 
-  /// Computes 0–100 per R/I/A/S/E/C from Likert answers {itemId: value}
   static Map<String, int> scoreRiasecToPercent({
     required List<Map<String, dynamic>> items,
-    required Map<int, int> answers, // itemId -> response
+    required Map<int, int> answers,
     int scaleMin = 1,
     int scaleMax = 5,
   }) {
@@ -1384,7 +1349,7 @@ class SupabaseService {
     final raw = {for (final c in codes) c: 0.0};
     final counts = {for (final c in codes) c: 0};
 
-    int inv(int v) => (scaleMax + scaleMin) - v; // returns int
+    int inv(int v) => (scaleMax + scaleMin) - v;
 
     for (final it in items) {
       final id = (it['id'] as num).toInt();
@@ -1420,8 +1385,7 @@ class SupabaseService {
     };
   }
 
-  // ---------- SECOND PROFILE BUILDER: RIASEC + NCAE + PATH ----------
-  /// Save a RIASEC result row for the current user
+  // ---------- RIASEC + NCAE + PATH ----------
   static Future<void> insertRiasec({
     required String userId,
     required int r,
@@ -1442,7 +1406,6 @@ class SupabaseService {
     });
   }
 
-  /// Save an NCAE result row for the current user
   static Future<void> insertNcae({
     required String userId,
     required int math,
@@ -1463,60 +1426,91 @@ class SupabaseService {
     });
   }
 
-  /// Preview the suggested strand + course using the Postgres rules (no write)
-  static Future<Map<String, dynamic>?> previewLearningPath() async {
-    // compute_learning_path() uses auth.uid() by default
-    final res = await supa.rpc('compute_learning_path');
-    if (res is List && res.isNotEmpty) {
-      return Map<String, dynamic>.from(res.first as Map);
+  // --- NEW: Recommendations based on SQL function `recommend_courses` ---
+  static Future<List<Map<String, dynamic>>> recommendCourses() async {
+    final uid = authUserId ?? (throw Exception('Not logged in'));
+    final res = await supa.rpc('recommend_courses', params: {'p_user': uid});
+    if (res is List) {
+      return res
+          .whereType<Map>() // guard against odd payloads
+          .map((e) => Map<String, dynamic>.from(e as Map))
+          .toList();
     }
+    return const [];
+  }
+
+  static Future<List<Map<String, dynamic>>> topRecommendations({
+    int n = 5,
+  }) async {
+    final rows = await recommendCourses();
+    return rows.take(n).toList();
+  }
+
+  static Future<Map<String, dynamic>?> previewRecommendation() async {
+    final list = await topRecommendations(n: 1);
+    return list.isEmpty ? null : list.first;
+  }
+
+  // Use the paramless API wrapper you created: api.compute_learning_path
+  static Future<Map<String, dynamic>?> previewLearningPath() async {
+    final res = await supa.rpc('compute_learning_path_preview'); // no params
+    if (res is Map) return Map<String, dynamic>.from(res);
+    if (res is List && res.isNotEmpty)
+      return Map<String, dynamic>.from(res.first);
     return null;
   }
 
-  /// Save (upsert) the suggested path into user_learning_path
+  // Must pass the uid to the uuid-version function
   static Future<void> finalizeLearningPath() async {
-    await supa.rpc('finalize_learning_path'); // uses auth.uid()
+    final uid = authUserId ?? (throw Exception('Not logged in'));
+    await supa.rpc('finalize_learning_path', params: {'p_user': uid});
   }
 
-  /// Read the saved path (strand_id + course name)
+  static Future<bool> hasSavedPath() async {
+    final uid = authUserId;
+    if (uid == null) return false;
+    final row =
+        await supa
+            .from('user_learning_path')
+            .select('user_id')
+            .eq('user_id', uid)
+            .limit(1)
+            .maybeSingle();
+    return row != null;
+  }
+
   static Future<Map<String, dynamic>?> getSavedPath() async {
     final uid = authUserId;
     if (uid == null) return null;
     final row =
         await supa
             .from('user_learning_path')
-            .select('strand_id, course_id, courses:course_id(name)')
+            .select('strand_id, track_id, course_id, courses:course_id(name)')
             .eq('user_id', uid)
             .maybeSingle();
     return row;
   }
 
   // ------------------- ASSESSMENT STATUS + FETCHERS -------------------
-  /// Returns whether the logged-in user has at least one row in each assessment.
-  /// Also returns the latest computed preview (if both exist).
   static Future<Map<String, dynamic>> getAssessmentStatus() async {
     final uid = authUserId;
     if (uid == null) throw 'Not logged in';
 
     final latestRIASEC = await getLatestRiasecRow();
-    final latestNCAE = await getLatestNcaeRow(); // from ncae_results table
+    final latestNCAE = await getLatestNcaeRow();
 
     final hasRiasec = latestRIASEC != null;
     final hasNcae = latestNCAE != null;
 
     Map<String, dynamic>? preview;
     if (hasRiasec && hasNcae) {
-      preview = await previewLearningPath();
+      // use new recommender preview
+      preview = await previewRecommendation();
     }
 
-    return {
-      'has_riasec': hasRiasec,
-      'has_ncae': hasNcae,
-      'preview': preview, // may be null
-    };
+    return {'has_riasec': hasRiasec, 'has_ncae': hasNcae, 'preview': preview};
   }
 
-  /// Latest row from riasec_results for auth user (or null)
   static Future<Map<String, dynamic>?> getLatestRiasecRow() async {
     final uid = authUserId;
     if (uid == null) return null;
@@ -1529,7 +1523,6 @@ class SupabaseService {
         .maybeSingle();
   }
 
-  /// Latest row from ncae_results for auth user (or null)
   static Future<Map<String, dynamic>?> getLatestNcaeRow() async {
     final uid = authUserId;
     if (uid == null) return null;
@@ -1542,14 +1535,7 @@ class SupabaseService {
         .maybeSingle();
   }
 
-  // ------------------- NCAE: map questionnaire_results → ncae_results -------------------
-  /// Reads the latest questionnaire_results row (your processed NCAE result)
-  /// and returns a map of percentiles keyed by our ncae_results schema.
-  ///
-  /// Expects questionnaire_results.results like:
-  ///   [{ "category": "Math", "percentage": "82.0", ... }, ...]
-  ///
-  /// Map your category labels here if they differ.
+  // ------------------- NCAE: questionnaire → ncae_results -------------------
   static Future<Map<String, int>?>
   getLatestNcaePercentilesFromQuestionnaire() async {
     final uid = authUserId;
@@ -1569,7 +1555,6 @@ class SupabaseService {
     final List<dynamic> results = (qr['results'] ?? []) as List<dynamic>;
     if (results.isEmpty) return null;
 
-    // Helper to fetch percentage by category name (case-insensitive)
     int pct(String category) {
       final row = results.firstWhere(
         (e) =>
@@ -1584,7 +1569,6 @@ class SupabaseService {
       return clipped.round();
     }
 
-    // 🔁 Map your categories → our columns
     return {
       'math_percentile': pct('Math'),
       'sci_percentile': pct('Science'),
@@ -1595,8 +1579,6 @@ class SupabaseService {
     };
   }
 
-  /// Convenience: upserts an ncae_results row using the *latest* questionnaire_results.
-  /// Returns true if inserted; false if there was nothing to insert.
   static Future<bool> upsertNcaeFromQuestionnaire() async {
     final uid = authUserId;
     if (uid == null) throw 'Not logged in';
@@ -1616,7 +1598,6 @@ class SupabaseService {
     return true;
   }
 
-  /// One call you can use from Home: if both assessments present, finalize path.
   static Future<bool> finalizeIfReady() async {
     final status = await getAssessmentStatus();
     if (status['has_riasec'] == true && status['has_ncae'] == true) {
@@ -1626,32 +1607,31 @@ class SupabaseService {
     return false;
   }
 
-  // In SupabaseService
   static Future<bool> userHasRiasecResult(String userId) async {
-    final r = await supa
-        .from('riasec_results')
-        .select('user_id')
-        .eq('user_id', userId)
-        .limit(1);
-    return r is List && r.isNotEmpty;
+    final row =
+        await supa
+            .from('riasec_results')
+            .select('id')
+            .eq('user_id', userId)
+            .order('taken_at', ascending: false)
+            .limit(1)
+            .maybeSingle(); // -> Map<String, dynamic>? or null
+    return row != null;
   }
 
   static Future<bool> userHasNcaeResult(String userId) async {
-    final n1 = await supa
-        .from('ncae_results')
-        .select('user_id')
-        .eq('user_id', userId)
-        .limit(1);
-    if (n1 is List && n1.isNotEmpty) return true;
-    final n2 = await supa
-        .from('questionnaire_results')
-        .select('user_id')
-        .eq('user_id', userId)
-        .limit(1);
-    return n2 is List && n2.isNotEmpty;
+    final row =
+        await supa
+            .from('ncae_results')
+            .select('id')
+            .eq('user_id', userId)
+            .order('taken_at', ascending: false)
+            .limit(1)
+            .maybeSingle();
+    return row != null;
   }
 
-  // Per-attempt history (optional; safe if table exists, no-op otherwise)
+  // ---------- Attempts / Limits ----------
   static Future<void> saveQuizAttempt({
     required String quizId,
     required int correct,
@@ -1669,7 +1649,6 @@ class SupabaseService {
       if (meta != null) 'meta': meta,
     });
   }
-  // === QUIZ ATTEMPT HELPERS ===
 
   static Future<bool> canTakeQuiz(String quizId) async {
     final res = await supa.rpc(
@@ -1678,7 +1657,6 @@ class SupabaseService {
     );
     if (res == null) return false;
     if (res is bool) return res;
-    // PostgREST can return 0/1 sometimes; be defensive:
     if (res is num) return res != 0;
     return false;
   }
