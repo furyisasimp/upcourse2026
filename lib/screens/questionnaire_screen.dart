@@ -91,10 +91,12 @@ class _QuestionnaireScreenState extends State<QuestionnaireScreen> {
     setState(() => _isSaving = true);
 
     try {
+      // 1) Raw responses -> questionnaire_responses
       await SupabaseService.saveQuestionnaireResponses(
         _answers.map((k, v) => MapEntry(k, int.parse(v))),
       );
 
+      // 2) Compute processed results -> questionnaire_results
       final latestResponse = await SupabaseService.getLatestResponse();
       final questionnaire = await SupabaseService.loadQuestionnaire();
 
@@ -104,11 +106,18 @@ class _QuestionnaireScreenState extends State<QuestionnaireScreen> {
         );
         final results = SupabaseService.processResults(answers, questionnaire);
 
-        // ✅ Save processed results into questionnaire_results
         await SupabaseService.saveProcessedResults(results);
 
+        // ✅ 3) Copy latest questionnaire_results into ncae_results
+        await SupabaseService.upsertNcaeFromQuestionnaire();
+
+        // ✅ 4) If both RIASEC + NCAE exist, finalize path
+        await SupabaseService.finalizeIfReady();
+
         if (!mounted) return;
-        Navigator.pushReplacement(
+
+        // Keep your ResultsScreen flow (panel will refresh when you pop back)
+        await Navigator.push(
           context,
           MaterialPageRoute(builder: (_) => ResultsScreen(results: results)),
         );
@@ -119,6 +128,9 @@ class _QuestionnaireScreenState extends State<QuestionnaireScreen> {
       ScaffoldMessenger.of(
         context,
       ).showSnackBar(const SnackBar(content: Text("Assessment completed!")));
+
+      // ✅ 5) Pop back to Home so CareerSetupPanel's .then(...) can refresh
+      if (Navigator.canPop(context)) Navigator.pop(context);
     } catch (e) {
       setState(() => _isSaving = false);
       if (!mounted) return;

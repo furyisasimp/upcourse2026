@@ -1,4 +1,7 @@
+import 'dart:convert';
 import 'package:flutter/material.dart';
+import 'package:flutter_markdown/flutter_markdown.dart';
+import 'package:supabase_flutter/supabase_flutter.dart';
 import 'package:career_roadmap/services/supabase_service.dart';
 import 'package:career_roadmap/screens/skills_screen.dart';
 
@@ -20,6 +23,7 @@ class _AdaptiveLessonScreenState extends State<AdaptiveLessonScreen> {
   List<Map<String, dynamic>> lessons = [];
   int currentIndex = 0;
   bool isLoading = true;
+  String? _inlineError;
 
   @override
   void initState() {
@@ -29,9 +33,13 @@ class _AdaptiveLessonScreenState extends State<AdaptiveLessonScreen> {
 
   Future<void> _loadLessons() async {
     final data = await SupabaseService.loadSkillModule(widget.moduleId);
+    if (!mounted) return;
 
     if (data.isEmpty) {
-      setState(() => isLoading = false);
+      setState(() {
+        isLoading = false;
+        _inlineError = 'No lessons found for ${widget.moduleId}.';
+      });
       return;
     }
 
@@ -40,18 +48,73 @@ class _AdaptiveLessonScreenState extends State<AdaptiveLessonScreen> {
       isLoading = false;
     });
 
-    // fetch progress so user continues where they left off
+    // Hydrate markdown bodies from storage:// URLs if needed
+    await _hydrateAllMissingContent();
+
+    // Continue where the user left off
     final progress = await SupabaseService.getSkillProgress();
     final module = progress.firstWhere(
       (p) => p['module_id'] == widget.moduleId,
       orElse: () => {},
     );
 
+    if (!mounted) return;
     if (module.isNotEmpty) {
       setState(() {
-        // lessons_completed reflects "last seen index"
         currentIndex = (module['lessons_completed'] as int?) ?? 0;
-        if (currentIndex >= lessons.length) currentIndex = 0; // ✅ prevent crash
+        if (currentIndex >= lessons.length) currentIndex = 0;
+      });
+    }
+  }
+
+  /// Parse storage://<bucket>/<path> → (bucket, path), normalizing bucket name.
+  (String, String)? _parseStorageUrl(String? url) {
+    if (url == null) return null;
+    final u = url.trim();
+    if (!u.startsWith('storage://')) return null;
+    final rest = u.substring('storage://'.length);
+    final slash = rest.indexOf('/');
+    if (slash <= 0) return null;
+    var bucket = rest.substring(0, slash);
+    final path = rest.substring(slash + 1);
+    if (bucket == 'skills-module') bucket = 'skill-modules'; // legacy typo
+    return (bucket, path);
+  }
+
+  /// Download text content and attach to lesson['content_md'] if missing.
+  Future<void> _hydrateAllMissingContent() async {
+    final client = Supabase.instance.client;
+    String? firstError;
+
+    for (int i = 0; i < lessons.length; i++) {
+      final m = lessons[i];
+      final hasMd = (m['content_md'] ?? '').toString().trim().isNotEmpty;
+      final url = (m['content_url'] ?? '').toString().trim();
+      if (hasMd || url.isEmpty) continue;
+
+      final parsed = _parseStorageUrl(url);
+      if (parsed == null) {
+        firstError ??= 'Invalid content_url: $url';
+        continue;
+      }
+
+      final (bucket, path) = parsed;
+
+      try {
+        final bytes = await client.storage.from(bucket).download(path);
+        final text = utf8.decode(bytes);
+        if (!mounted) return;
+        setState(() {
+          lessons[i] = {...m, 'content_md': text};
+        });
+      } catch (e) {
+        firstError ??= 'Failed to fetch $bucket/$path: $e';
+      }
+    }
+
+    if (firstError != null && mounted) {
+      setState(() {
+        _inlineError = firstError;
       });
     }
   }
@@ -69,13 +132,12 @@ class _AdaptiveLessonScreenState extends State<AdaptiveLessonScreen> {
       setState(() => currentIndex++);
       await _updateProgress();
     } else {
-      // ✅ On Finish
+      // finished module
       await SupabaseService.updateSkillProgress(
         widget.moduleId,
         lessons.length,
         lessons.length,
       );
-
       if (!mounted) return;
       Navigator.pushReplacement(
         context,
@@ -109,6 +171,11 @@ class _AdaptiveLessonScreenState extends State<AdaptiveLessonScreen> {
     }
 
     final lesson = lessons[currentIndex];
+    final String title = (lesson['title'] ?? '').toString().trim();
+    final String md = (lesson['content_md'] ?? '').toString().trim();
+    final String summary = (lesson['content_summary'] ?? '').toString().trim();
+    final int practiceCount =
+        lesson['practice'] is List ? (lesson['practice'] as List).length : 0;
 
     return Scaffold(
       appBar: AppBar(
@@ -133,7 +200,6 @@ class _AdaptiveLessonScreenState extends State<AdaptiveLessonScreen> {
               color: Colors.black,
             ),
             const SizedBox(height: 16),
-            const SizedBox(height: 12),
             Text(
               "Lesson ${currentIndex + 1} of ${lessons.length}",
               style: const TextStyle(
@@ -142,14 +208,27 @@ class _AdaptiveLessonScreenState extends State<AdaptiveLessonScreen> {
                 fontSize: 18,
               ),
             ),
-            const SizedBox(height: 12),
+            const SizedBox(height: 8),
+            if (_inlineError != null)
+              Padding(
+                padding: const EdgeInsets.only(bottom: 6),
+                child: Text(
+                  _inlineError!,
+                  style: const TextStyle(
+                    fontFamily: 'Inter',
+                    fontSize: 12,
+                    color: Colors.redAccent,
+                  ),
+                ),
+              ),
+            const SizedBox(height: 6),
             Expanded(
               child: SingleChildScrollView(
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
                     Text(
-                      lesson['title'] ?? '',
+                      title,
                       style: const TextStyle(
                         fontFamily: 'Poppins',
                         fontSize: 20,
@@ -157,14 +236,62 @@ class _AdaptiveLessonScreenState extends State<AdaptiveLessonScreen> {
                       ),
                     ),
                     const SizedBox(height: 10),
-                    Text(
-                      lesson['content_summary'] ?? '',
-                      style: const TextStyle(
-                        fontFamily: 'Inter',
-                        fontSize: 16,
-                        fontWeight: FontWeight.w400,
+
+                    // Prefer Markdown body; fallback to summary; otherwise info text.
+                    if (md.isNotEmpty)
+                      MarkdownBody(
+                        data: md,
+                        styleSheet: MarkdownStyleSheet.fromTheme(
+                          Theme.of(context),
+                        ).copyWith(
+                          p: const TextStyle(fontFamily: 'Inter', fontSize: 16),
+                          h1: const TextStyle(
+                            fontFamily: 'Poppins',
+                            fontWeight: FontWeight.w700,
+                          ),
+                          h2: const TextStyle(
+                            fontFamily: 'Poppins',
+                            fontWeight: FontWeight.w700,
+                          ),
+                        ),
+                      )
+                    else if (summary.isNotEmpty)
+                      Text(
+                        summary,
+                        style: const TextStyle(
+                          fontFamily: 'Inter',
+                          fontSize: 16,
+                          fontWeight: FontWeight.w400,
+                        ),
+                      )
+                    else
+                      Builder(
+                        builder: (context) {
+                          final url = (lesson['content_url'] ?? '').toString();
+                          return Text(
+                            url.isNotEmpty
+                                ? 'No inline content. Attached: $url'
+                                : 'No content provided for this lesson.',
+                            style: const TextStyle(
+                              fontFamily: 'Inter',
+                              fontSize: 14,
+                              color: Colors.black54,
+                            ),
+                          );
+                        },
                       ),
-                    ),
+
+                    if (practiceCount > 0) ...[
+                      const SizedBox(height: 16),
+                      Text(
+                        'Practice items: $practiceCount',
+                        style: const TextStyle(
+                          fontFamily: 'Inter',
+                          fontSize: 13,
+                          color: Colors.black54,
+                        ),
+                      ),
+                    ],
                   ],
                 ),
               ),
