@@ -1332,24 +1332,128 @@ class SupabaseService {
     }
   }
 
-  // ---- QUIZ: BANK + TOS LOADER (root-bucket + admin JSON aware) ----
+  // ---- QUIZ: BANK + TOS LOADER (root-bucket + admin JSON aware; ALL when totalOverride<=0) ----
   static Future<List<Map<String, dynamic>>> fetchQuizWithTOS({
     required String quizId,
     String bucket = 'quizzes',
     int? seed,
-    int totalOverride = 10,
+    int totalOverride = 10, // <=0 means ALL
   }) async {
     // helpers
     String _squash(String s) =>
         s.toLowerCase().replaceAll(RegExp(r'[^a-z0-9]+'), '');
+
     String _hyphenize(String s) => s
         .toLowerCase()
         .replaceAll(RegExp(r'[^a-z0-9]+'), '-')
-        .replaceAll(RegExp(r'-+'), '-');
+        .replaceAll(RegExp(r'-+'), '-')
+        .replaceAll(RegExp(r'^-|-$'), '');
+
+    // used by direct filename guesses (underscored id)
+    String _normalizeId(String s) => s
+        .toLowerCase()
+        .replaceAll(RegExp(r'[^a-z0-9]+'), '_')
+        .replaceAll(RegExp(r'_+'), '_')
+        .replaceAll(RegExp(r'^_|_$'), '');
+
+    // ensure public_url on media lists
+    Map<String, dynamic> _ensurePublicUrls(
+      Map<String, dynamic> q, {
+      required String bucket,
+    }) {
+      List<Map<String, dynamic>> _fixList(dynamic val) {
+        final list = (val is List) ? val : const <dynamic>[];
+        return list.map<Map<String, dynamic>>((e) {
+          final m = Map<String, dynamic>.from(e as Map);
+          final path = (m['path'] ?? '').toString();
+          final bkt = (m['bucket'] ?? bucket).toString();
+          if ((m['public_url'] == null || '${m['public_url']}'.isEmpty) &&
+              path.isNotEmpty) {
+            try {
+              final pub = supa.storage.from(bkt).getPublicUrl(path);
+              m['public_url'] = pub;
+            } catch (_) {
+              // ignore
+            }
+          }
+          return m;
+        }).toList();
+      }
+
+      final out = Map<String, dynamic>.from(q);
+      out['images'] = _fixList(q['images']);
+      out['files'] = _fixList(q['files']);
+      return out;
+    }
+
+    // normalize admin question → app shape (keeps media + difficulty + allow_multiple)
+    // Supports: "choice" and "text"
+    Map<String, dynamic> _normalizeAdminQ(Map<String, dynamic> src) {
+      final m = Map<String, dynamic>.from(src);
+      final String type =
+          (m['question_type'] ?? 'choice').toString().toLowerCase();
+
+      List _asList(v) => (v is List) ? v : const <dynamic>[];
+
+      // TEXT question
+      if (type == 'text') {
+        final out = <String, dynamic>{
+          'text': (m['question_text'] ?? '').toString(),
+          'is_text': true,
+          'answer_texts':
+              _asList(m['choices']).map((e) => e.toString()).toList(),
+          'text_any_case': m['text_any_case'] == true,
+          'enable_math': m['enable_math'] == true,
+          'images': _asList(m['images']),
+          'files': _asList(m['files']),
+          'question_id': m['question_id'],
+          'points': m['points'],
+          'required': m['required'],
+          'difficulty': (m['difficulty'] ?? '').toString(),
+        };
+        if ((out['text'] as String).trim().isEmpty) {
+          return const <String, dynamic>{};
+        }
+        return _ensurePublicUrls(out, bucket: bucket);
+      }
+
+      // MULTIPLE CHOICE
+      if (type != 'choice') return const <String, dynamic>{}; // skip others
+
+      final List<String> options =
+          _asList(m['choices']).map((e) => e.toString()).toList();
+
+      final List<int> idxs =
+          _asList(
+            m['correct_answers'],
+          ).whereType<num>().map((n) => n.toInt()).toList();
+
+      final out = <String, dynamic>{
+        'text': (m['question_text'] ?? '').toString(),
+        'options': options,
+        'difficulty': (m['difficulty'] ?? '').toString(),
+        'allow_multiple': m['allow_multiple'] == true,
+        if ((m['allow_multiple'] == true) && idxs.isNotEmpty)
+          'correct_answers': idxs,
+        if (!(m['allow_multiple'] == true) && idxs.isNotEmpty)
+          'answer_index': idxs.first,
+        'images': _asList(m['images']),
+        'files': _asList(m['files']),
+        'question_id': m['question_id'],
+        'points': m['points'],
+        'required': m['required'],
+        'enable_math': m['enable_math'],
+      };
+
+      if ((out['text'] as String).trim().isEmpty || options.isEmpty) {
+        return const <String, dynamic>{};
+      }
+      return _ensurePublicUrls(out, bucket: bucket);
+    }
 
     final rnd = seed == null ? Random() : Random(seed);
     List<T> pick<T>(List<T> list, int n) {
-      if (n <= 0 || list.isEmpty) return <T>[]; // <-- not const
+      if (n <= 0 || list.isEmpty) return <T>[];
       final copy = List<T>.of(list);
       for (int i = copy.length - 1; i > 0; i--) {
         final j = rnd.nextInt(i + 1);
@@ -1367,29 +1471,39 @@ class SupabaseService {
       required int total,
     }) {
       final counts = <String, int>{...want};
-      for (final k in counts.keys) {
-        counts[k] = counts[k]!.clamp(0, pools[k]!.length);
+      for (final k in counts.keys.toList()) {
+        final poolLen = pools[k]?.length ?? 0;
+        final v = counts[k] ?? 0;
+        counts[k] = v.clamp(0, poolLen);
       }
+
       int sum = counts.values.fold(0, (a, b) => a + b);
+
+      // trim hardest-first if overshoot
       while (sum > total) {
         for (final k in const ['hard', 'medium', 'easy']) {
-          if (counts[k]! > 0 && sum > total) {
-            counts[k] = counts[k]! - 1;
+          final v = counts[k] ?? 0;
+          if (v > 0 && sum > total) {
+            counts[k] = v - 1;
             sum--;
           }
         }
       }
-      final room = {
-        'easy': pools['easy']!.length - counts['easy']!,
-        'medium': pools['medium']!.length - counts['medium']!,
-        'hard': pools['hard']!.length - counts['hard']!,
+
+      // refill from buckets with most room
+      final room = <String, int>{
+        for (final k in ['easy', 'medium', 'hard'])
+          k: (pools[k]?.length ?? 0) - (counts[k] ?? 0),
       };
       while (sum < total) {
-        final next = (['easy', 'medium', 'hard']..sort(
-          (a, b) => room[b]!.compareTo(room[a]!),
-        )).firstWhere((k) => room[k]! > 0, orElse: () => 'easy');
-        counts[next] = counts[next]! + 1;
-        room[next] = room[next]! - 1;
+        final order = ['easy', 'medium', 'hard']
+          ..sort((a, b) => (room[b] ?? 0).compareTo(room[a] ?? 0));
+        final next = order.firstWhere(
+          (k) => (room[k] ?? 0) > 0,
+          orElse: () => 'easy',
+        );
+        counts[next] = (counts[next] ?? 0) + 1;
+        room[next] = (room[next] ?? 0) - 1;
         sum++;
       }
       return counts;
@@ -1409,7 +1523,6 @@ class SupabaseService {
           'quiz-$norm.json',
           'quiz_$hyph.json',
           '${norm}_quiz.json',
-          // common admin filename patterns: "<title>-quiz_<id>.json"
           '${hyph}_quiz.json',
           '${hyph}-quiz.json',
         }.toList();
@@ -1446,13 +1559,11 @@ class SupabaseService {
 
       for (final f in jsonFiles) {
         final s = _squash(f.replaceAll('.json', ''));
-        // simple overlap score: length of longest common substring-ish window
         int score = 0;
         final n = min(s.length, goal.length);
         for (int k = 1; k <= n; k++) {
           if (goal.contains(s.substring(0, k))) score = k;
         }
-        // also reward presence of "quiz_" id tail if any
         if (s.contains('quiz') && goal.contains('quiz')) score += 3;
         if (score > bestScore) {
           bestScore = score;
@@ -1479,81 +1590,66 @@ class SupabaseService {
 
     final decoded = json.decode(utf8.decode(payload!));
 
-    // If the file is a raw bank (List) → handle TOS sidecar (optional) + return
+    // Case 0: raw list bank
     if (decoded is List) {
       final bank =
-          decoded.map((e) => Map<String, dynamic>.from(e as Map)).toList();
-      if (bank.isEmpty) return const [];
+          decoded
+              .map((e) => Map<String, dynamic>.from(e as Map))
+              .map((q) => _ensurePublicUrls(q, bucket: bucket))
+              .toList();
+      if (bank.isEmpty) return const <Map<String, dynamic>>[];
+      if (totalOverride <= 0) return bank; // ALL
       final target = min(totalOverride, bank.length);
       final copy = List<Map<String, dynamic>>.of(bank)..shuffle(rnd);
       return copy.take(target).toList();
     }
 
-    if (decoded is! Map) return const [];
+    if (decoded is! Map) return const <Map<String, dynamic>>[];
     final root = Map<String, dynamic>.from(decoded);
 
-    // If it’s an admin quiz wrapper with title/metadata
-    List<Map<String, dynamic>> _mapAdminQuestions(List rawQs) {
-      final out = <Map<String, dynamic>>[];
-      for (final q0 in rawQs) {
-        final q = Map<String, dynamic>.from(q0 as Map);
-
-        final String type =
-            (q['question_type'] ?? 'choice').toString().toLowerCase();
-
-        // We only support choice / multi-choice in the current UI.
-        if (type != 'choice') {
-          // skip "text" for now
-          continue;
-        }
-
-        final List<String> options =
-            ((q['choices'] as List?) ?? const [])
-                .map((e) => e.toString())
-                .toList();
-
-        // admin JSON uses 0-based indexes in correct_answers
-        final List<int> idxs =
-            ((q['correct_answers'] as List?) ?? const [])
-                .whereType<num>()
-                .map((n) => n.toInt())
-                .toList();
-
-        final m = <String, dynamic>{
-          'text': (q['question_text'] ?? '').toString(),
-          'options': options,
-          'difficulty': (q['difficulty'] ?? '').toString(),
-          'allow_multiple': q['allow_multiple'] == true,
-          if ((q['allow_multiple'] == true) && idxs.isNotEmpty)
-            'correct_answers': idxs,
-          if (!(q['allow_multiple'] == true) && idxs.isNotEmpty)
-            // legacy single-answer compatibility
-            'answer_index': idxs.first,
-        };
-
-        // only add well-formed choice questions
-        if ((m['text'] as String).trim().isNotEmpty && options.isNotEmpty) {
-          out.add(m);
-        }
-      }
-      return out;
-    }
-
-    // case A: admin wrapper with questions[]
+    // Case A: admin wrapper with questions[]
     if (root['questions'] is List) {
-      final bank = _mapAdminQuestions(root['questions'] as List);
-      if (bank.isEmpty) return const [];
+      final rawQs =
+          (root['questions'] as List)
+              .map((e) => Map<String, dynamic>.from(e as Map))
+              .toList();
 
-      // optional embedded TOS/pools, else simple shuffle → trim
+      // normalize + add public_url; skip unsupported types
+      final bank = <Map<String, dynamic>>[];
+      for (final q in rawQs) {
+        final m = _normalizeAdminQ(q);
+        if (m.isNotEmpty) bank.add(m);
+      }
+      if (bank.isEmpty) return const <Map<String, dynamic>>[];
+
+      // pools/tos logic (optional)
       if (root['pools'] is Map) {
         final poolsRaw = Map<String, dynamic>.from(root['pools']);
+
+        List<Map<String, dynamic>> _normPool(List? lst) {
+          final src = (lst ?? const <dynamic>[]);
+          final out = <Map<String, dynamic>>[];
+          for (final e in src) {
+            final m = _normalizeAdminQ(Map<String, dynamic>.from(e as Map));
+            if (m.isNotEmpty) out.add(m);
+          }
+          return out;
+        }
+
         final pools = <String, List<Map<String, dynamic>>>{
-          'easy': _mapAdminQuestions(((poolsRaw['easy'] as List?) ?? const [])),
-          'medium': _mapAdminQuestions(
-            ((poolsRaw['medium'] as List?) ?? const []),
-          ),
-          'hard': _mapAdminQuestions(((poolsRaw['hard'] as List?) ?? const [])),
+          'easy': _normPool(poolsRaw['easy'] as List?),
+          'medium': _normPool(poolsRaw['medium'] as List?),
+          'hard': _normPool(poolsRaw['hard'] as List?),
         };
+
+        if (totalOverride <= 0) {
+          return <Map<String, dynamic>>[
+            ...pools['easy']!,
+            ...pools['medium']!,
+            ...pools['hard']!,
+          ];
+        }
+
         final sel =
             (root['selection'] is Map)
                 ? Map<String, dynamic>.from(root['selection'])
@@ -1602,22 +1698,32 @@ class SupabaseService {
         return all.take(min(total, all.length)).toList();
       }
 
+      // No pools/tos: ALL or trimmed
+      if (totalOverride <= 0) return bank; // ALL
       final target = min(totalOverride, bank.length);
       final copy = List<Map<String, dynamic>>.of(bank)..shuffle(rnd);
       return copy.take(target).toList();
     }
 
-    // case B: legacy pools-only file (no wrapper list)
+    // Case B: legacy pools-only file (no wrapper list)
     if (root['pools'] is Map) {
       final poolsRaw = Map<String, dynamic>.from(root['pools']);
       List<Map<String, dynamic>> _asList(dynamic v) =>
           (v is List)
-              ? v.map((e) => Map<String, dynamic>.from(e)).toList()
+              ? v.map((e) => Map<String, dynamic>.from(e as Map)).toList()
               : <Map<String, dynamic>>[];
 
-      final easy = _asList(poolsRaw['easy']);
-      final medium = _asList(poolsRaw['medium']);
-      final hard = _asList(poolsRaw['hard']);
+      // ensure media urls if present (legacy format)
+      List<Map<String, dynamic>> _fixMedia(List<Map<String, dynamic>> src) =>
+          src.map((m) => _ensurePublicUrls(m, bucket: bucket)).toList();
+
+      final easy = _fixMedia(_asList(poolsRaw['easy']));
+      final medium = _fixMedia(_asList(poolsRaw['medium']));
+      final hard = _fixMedia(_asList(poolsRaw['hard']));
+
+      if (totalOverride <= 0) {
+        return <Map<String, dynamic>>[...easy, ...medium, ...hard];
+      }
 
       final sel =
           (root['selection'] is Map)
@@ -1665,7 +1771,7 @@ class SupabaseService {
       return all.take(min(total, all.length)).toList();
     }
 
-    return const [];
+    return const <Map<String, dynamic>>[];
   }
 
   // ---------- HELPERS ----------

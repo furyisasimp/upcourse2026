@@ -11,7 +11,7 @@ dependencies:
   flutter:
     sdk: flutter
   image_picker: ^0.8.4
-  http: ^0.13.6  # For API calls
+  http: ^1.0.0  # For API calls
   crypto: ^3.0.3 # For password hashing
   percent_indicator: ^4.2.2
   fl_chart: ^0.66.0
@@ -22,8 +22,10 @@ dependencies:
   supabase_flutter: ^2.0.0
   flutter_markdown: ^0.6.18
   flutter_math_fork: ^0.7.2
-  url_launcher: ^6.3.1 
-  screen_capture_event: ^1.1.2
+  url_launcher: ^6.3.0 
+  pdfx: ^2.6.0
+  syncfusion_flutter_pdfviewer: ^25.2.4
+  screen_capture_event: ^1.2.0
 
 dev_dependencies:
   flutter_test:

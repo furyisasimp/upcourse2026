@@ -3,6 +3,12 @@ import 'dart:async';
 import 'dart:io' show Platform;
 import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:flutter/material.dart';
+
+// Inline PDFs (+ open externally)
+import 'package:syncfusion_flutter_pdfviewer/pdfviewer.dart';
+import 'package:url_launcher/url_launcher.dart';
+
+// Anti-cheat (Android/iOS/macOS only)
 import 'package:screen_capture_event/screen_capture_event.dart';
 
 import 'home_screen.dart';
@@ -12,6 +18,15 @@ import 'package:career_roadmap/services/quiz_security_service.dart';
 class Question {
   final String text;
   final List<String> options;
+
+  // NEW: text-entry support
+  final bool isText; // true when question_type == "text"
+  final List<String> answerTexts; // accepted answers for text questions
+  final bool textAnyCase; // loose/case-insensitive if true
+
+  // media (optional; passed through from service)
+  final List<Map<String, dynamic>> files; // pdfs or other files
+  final List<Map<String, dynamic>> images; // image attachments
 
   // Single-answer legacy
   final int? rawIndex; // from answer_index / correct_index
@@ -26,11 +41,16 @@ class Question {
   Question({
     required this.text,
     required this.options,
+    this.isText = false,
+    this.answerTexts = const <String>[],
+    this.textAnyCase = true,
     this.rawIndex,
     this.correctText,
     this.explanation,
     this.allowMultiple = false,
     this.correctIndexes = const <int>[],
+    this.files = const <Map<String, dynamic>>[],
+    this.images = const <Map<String, dynamic>>[],
   });
 
   factory Question.fromJson(Map<String, dynamic> json) {
@@ -50,9 +70,34 @@ class Question {
                 .toList()
             : const <int>[];
 
+    // pass-through media
+    List<Map<String, dynamic>> _listOfMap(dynamic v) =>
+        (v is List)
+            ? v
+                .whereType<dynamic>()
+                .map((e) => Map<String, dynamic>.from(e as Map))
+                .toList()
+            : <Map<String, dynamic>>[];
+
+    // Detect text questions and lift accepted answers from choices
+    final String qType = (json['question_type'] ?? '').toString().toLowerCase();
+    final bool isText = json['is_text'] == true || qType == 'text';
+    final List<String> choices =
+        ((json['options'] ?? json['choices']) as List? ?? const [])
+            .map((e) => '$e')
+            .toList();
+
     return Question(
-      text: (json['text'] ?? '').toString(),
-      options: (json['options'] as List).map((e) => '$e').toList(),
+      text: (json['text'] ?? json['question_text'] ?? '').toString(),
+      options: isText ? const <String>[] : choices,
+      // NEW:
+      isText: isText,
+      answerTexts: isText ? choices : const <String>[],
+      textAnyCase:
+          (json['text_any_case'] == null)
+              ? true
+              : (json['text_any_case'] == true),
+      // legacy + media
       rawIndex: idx,
       correctText: txt,
       explanation:
@@ -62,6 +107,8 @@ class Question {
               : null,
       allowMultiple: multi,
       correctIndexes: idxs,
+      files: _listOfMap(json['files']),
+      images: _listOfMap(json['images']),
     );
   }
 
@@ -119,8 +166,7 @@ class _QuizScreenState extends State<QuizScreen> {
   }
 
   // --- State
-  // String for single-answer, Set<int> for multi-answer questions
-  final Map<int, dynamic> _answers = {};
+  final Map<int, dynamic> _answers = {}; // String or Set<int>
   final List<Question> _questions = [];
   final List<GlobalKey> _qKeys = [];
   final ScrollController _scroll = ScrollController();
@@ -155,14 +201,19 @@ class _QuizScreenState extends State<QuizScreen> {
 
   bool get _supportsScreenCapture =>
       !kIsWeb && (Platform.isAndroid || Platform.isIOS || Platform.isMacOS);
-  // Windows/Linux are explicitly NOT supported by the plugin.
 
   @override
   void initState() {
     super.initState();
     if (_supportsScreenCapture) {
-      _screenCapture = ScreenCaptureEvent();
-      _initScreenCapture();
+      try {
+        _screenCapture = ScreenCaptureEvent();
+        _initScreenCapture();
+      } catch (e) {
+        // fail-open: proceed without anti-cheat if plugin not available
+        debugPrint('screen_capture_event init skipped: $e');
+        _screenCapture = null;
+      }
     }
     _checkGateAndLoad();
   }
@@ -170,15 +221,14 @@ class _QuizScreenState extends State<QuizScreen> {
   @override
   void dispose() {
     _ticker?.cancel();
-    _screenCapture?.dispose(); // safe: only when created
+    _screenCapture?.dispose();
     _scroll.dispose();
-    _scaffoldMessenger?.clearSnackBars(); // no context lookup here
+    _scaffoldMessenger?.clearSnackBars();
     super.dispose();
   }
 
-  // Stop all transient activity before leaving the route.
   void _prepareForExit() {
-    _leaving = true; // tells listeners to ignore
+    _leaving = true;
     _ticker?.cancel();
     _scaffoldMessenger ??= ScaffoldMessenger.maybeOf(context);
     _scaffoldMessenger?.clearSnackBars();
@@ -203,7 +253,6 @@ class _QuizScreenState extends State<QuizScreen> {
       // ignore – fail-open
     }
 
-    // Listeners exist ONLY when plugin is supported
     _screenCapture?.addScreenShotListener((_) {
       _handleSecurityEvent('screenshot');
     });
@@ -333,9 +382,11 @@ class _QuizScreenState extends State<QuizScreen> {
         return;
       }
 
+      // IMPORTANT: ask for ALL questions (no sampling)
       final selected = await SupabaseService.fetchQuizWithTOS(
         quizId: _programId,
         bucket: 'quizzes',
+        totalOverride: 0, // <= 0 => ALL
       );
       if (!mounted) return;
 
@@ -376,6 +427,7 @@ class _QuizScreenState extends State<QuizScreen> {
     }
   }
 
+  // Canonicalization for loose comparison (case/spacing/punctuation-insensitive)
   String _canon(String? s) {
     final t = (s ?? '').trim().toLowerCase();
     final squashed = t.replaceAll(RegExp(r'\s+'), ' ');
@@ -419,6 +471,30 @@ class _QuizScreenState extends State<QuizScreen> {
     for (var i = 0; i < _questions.length; i++) {
       final q = _questions[i];
       final ans = _answers[i];
+
+      // TEXT questions
+      if (q.isText) {
+        final given = (ans is String) ? ans : '';
+        if (given.trim().isNotEmpty) {
+          // build a typed pool of accepted answers
+          final List<String> pool =
+              q.answerTexts.isNotEmpty
+                  ? List<String>.from(q.answerTexts)
+                  : (q.correctText != null
+                      ? <String>[q.correctText!]
+                      : const <String>[]);
+
+          final Set<String> allowed =
+              pool
+                  .map<String>((a) => q.textAnyCase ? _canon(a) : a.trim())
+                  .toSet();
+
+          final String test = q.textAnyCase ? _canon(given) : given.trim();
+          if (allowed.contains(test)) correct++;
+        }
+        // Do not record index for text questions (indices are meaningless)
+        continue;
+      }
 
       if (q.allowMultiple) {
         final Set<int> given = (ans is Set<int>) ? ans : <int>{};
@@ -578,7 +654,6 @@ class _QuizScreenState extends State<QuizScreen> {
     return shouldExit ?? false;
   }
 
-  // Kick off the confirm dialog & safely pop after quiescing the page.
   Future<void> _requestExit() async {
     if (!mounted) return;
     final ok = await _confirmExit();
@@ -660,7 +735,6 @@ class _QuizScreenState extends State<QuizScreen> {
                     onPressed: _requestExit,
                   ),
         ),
-
         bottomNavigationBar:
             _loading || _submitted || _questions.isEmpty || _blocked
                 ? null
@@ -695,7 +769,6 @@ class _QuizScreenState extends State<QuizScreen> {
                     ),
                   ),
                 ),
-
         body:
             _loading
                 ? const Center(child: CircularProgressIndicator())
@@ -738,7 +811,6 @@ class _QuizScreenState extends State<QuizScreen> {
                         elapsedSec: _elapsedSec,
                       ),
                     ),
-
                     if (!_submitted && !_blocked && _cheatStrikes > 0)
                       Padding(
                         padding: EdgeInsets.fromLTRB(hPad, 8, hPad, 0),
@@ -775,7 +847,6 @@ class _QuizScreenState extends State<QuizScreen> {
                           ),
                         ),
                       ),
-
                     if (_questions.isNotEmpty)
                       Padding(
                         padding: EdgeInsets.fromLTRB(hPad, 4, hPad, 6),
@@ -789,6 +860,32 @@ class _QuizScreenState extends State<QuizScreen> {
                             final q = _questions[i];
                             final ans = _answers[i];
                             if (ans == null) return false;
+
+                            // TEXT
+                            if (q.isText) {
+                              final List<String> pool =
+                                  q.answerTexts.isNotEmpty
+                                      ? List<String>.from(q.answerTexts)
+                                      : (q.correctText != null
+                                          ? <String>[q.correctText!]
+                                          : const <String>[]);
+
+                              final Set<String> allowed =
+                                  pool
+                                      .map<String>(
+                                        (a) =>
+                                            q.textAnyCase
+                                                ? _canon(a)
+                                                : a.trim(),
+                                      )
+                                      .toSet();
+
+                              final String test =
+                                  q.textAnyCase
+                                      ? _canon(ans as String)
+                                      : (ans as String).trim();
+                              return allowed.contains(test);
+                            }
 
                             if (q.allowMultiple) {
                               final Set<int> given =
@@ -817,7 +914,6 @@ class _QuizScreenState extends State<QuizScreen> {
                           onTap: _scrollTo,
                         ),
                       ),
-
                     Expanded(
                       child: ListView.builder(
                         controller: _scroll,
@@ -842,7 +938,6 @@ class _QuizScreenState extends State<QuizScreen> {
                         },
                       ),
                     ),
-
                     if (_submitted)
                       Padding(
                         padding: EdgeInsets.fromLTRB(hPad, 0, hPad, 16),
@@ -1068,7 +1163,7 @@ class _QuestionCard extends StatelessWidget {
   final bool submitted;
   final Color accent;
   final ValueChanged<dynamic>
-  onChanged; // String for single, Set<int> for multi
+  onChanged; // String for single/text, Set<int> for multi
 
   const _QuestionCard({
     required this.index,
@@ -1084,6 +1179,21 @@ class _QuestionCard extends StatelessWidget {
     final squashed = t.replaceAll(RegExp(r'\s+'), ' ');
     final stripped = squashed.replaceAll(RegExp(r'[^\w\s]'), '');
     return stripped;
+  }
+
+  // Extract a likely usable URL from a file/image map
+  String? _urlFrom(Map<String, dynamic> m) {
+    final raw = (m['public_url'] ?? m['url'] ?? m['path'] ?? '').toString();
+    if (raw.startsWith('http')) return raw;
+    return null;
+  }
+
+  Future<void> _openExternal(String url) async {
+    final uri = Uri.tryParse(url);
+    if (uri == null) return;
+    if (await canLaunchUrl(uri)) {
+      await launchUrl(uri, mode: LaunchMode.externalApplication);
+    }
   }
 
   @override
@@ -1104,6 +1214,27 @@ class _QuestionCard extends StatelessWidget {
 
     bool computeCorrect(dynamic sel) {
       if (!submitted || !hasAnswer) return false;
+
+      // TEXT mode
+      if (question.isText) {
+        if (sel is! String || sel.trim().isEmpty) return false;
+
+        final List<String> pool =
+            question.answerTexts.isNotEmpty
+                ? List<String>.from(question.answerTexts)
+                : (question.correctText != null
+                    ? <String>[question.correctText!]
+                    : const <String>[]);
+
+        final Set<String> allowed =
+            pool
+                .map<String>((a) => question.textAnyCase ? _canon(a) : a.trim())
+                .toSet();
+
+        final String test = question.textAnyCase ? _canon(sel) : sel.trim();
+        return allowed.contains(test);
+      }
+
       if (question.allowMultiple) {
         final Set<int> given = (sel is Set<int>) ? sel : <int>{};
         final Set<int> correctSet = question.correctIndexes.toSet();
@@ -1125,10 +1256,136 @@ class _QuestionCard extends StatelessWidget {
 
     final bool isCorrect = computeCorrect(selected);
 
+    // ---------- MEDIA (images + pdfs) ----------
+    final List<Widget> media = [];
+
+    // Images (contained, not huge; maintain aspect)
+    final imgs = question.images
+        .map(_urlFrom)
+        .whereType<String>()
+        .toList(growable: false);
+    for (final url in imgs) {
+      media.add(
+        ClipRRect(
+          borderRadius: BorderRadius.circular(10),
+          child: Container(
+            constraints: const BoxConstraints(maxHeight: 240),
+            width: double.infinity,
+            color: Colors.black12.withOpacity(.04),
+            child: FittedBox(
+              fit: BoxFit.contain, // show full image without cropping
+              alignment: Alignment.center,
+              child: Image.network(
+                url,
+                filterQuality: FilterQuality.medium,
+                loadingBuilder: (c, w, p) {
+                  if (p == null) return w;
+                  return SizedBox(
+                    height: 180,
+                    child: Center(
+                      child: CircularProgressIndicator(
+                        value:
+                            p.expectedTotalBytes != null
+                                ? p.cumulativeBytesLoaded /
+                                    (p.expectedTotalBytes!)
+                                : null,
+                      ),
+                    ),
+                  );
+                },
+                errorBuilder:
+                    (_, __, ___) => Container(
+                      alignment: Alignment.center,
+                      padding: const EdgeInsets.all(16),
+                      child: const Text(
+                        'Image failed to load',
+                        style: TextStyle(fontFamily: 'Inter'),
+                      ),
+                    ),
+              ),
+            ),
+          ),
+        ),
+      );
+      media.add(const SizedBox(height: 10));
+    }
+
+    // PDFs (lazy mount viewers to avoid freezes)
+    final pdfs = question.files
+        .where(
+          (f) =>
+              (f['mime']?.toString().toLowerCase() ?? '').contains('pdf') ||
+              (f['name']?.toString().toLowerCase() ?? '').endsWith('.pdf') ||
+              (f['path']?.toString().toLowerCase() ?? '').endsWith('.pdf'),
+        )
+        .map(_urlFrom)
+        .whereType<String>()
+        .toList(growable: false);
+
+    for (final url in pdfs) {
+      media.add(
+        _PdfInline(
+          url: url,
+          accent: accent,
+          onOpenExternally: () => _openExternal(url),
+        ),
+      );
+      media.add(const SizedBox(height: 10));
+    }
+
+    // Soft hint when file exists but no public URL
+    if (question.files.isNotEmpty && pdfs.isEmpty) {
+      media.add(
+        Container(
+          padding: const EdgeInsets.all(10),
+          decoration: BoxDecoration(
+            color: Colors.amber.withOpacity(.12),
+            borderRadius: BorderRadius.circular(10),
+          ),
+          child: const Text(
+            'This question has a PDF attachment, but no public URL was provided. '
+            'Ensure SupabaseService adds `public_url` to each file.',
+            style: TextStyle(fontFamily: 'Inter', fontSize: 12.5),
+          ),
+        ),
+      );
+      media.add(const SizedBox(height: 10));
+    }
+
     Widget _buildUnsubmitted() {
+      final List<Widget> children = [...media];
+
+      // TEXT input UI
+      if (question.isText) {
+        final controller = TextEditingController(
+          text: (selected is String) ? selected as String : '',
+        );
+        children.add(
+          Container(
+            margin: const EdgeInsets.only(top: 6),
+            decoration: BoxDecoration(
+              border: Border.all(color: Colors.grey.shade300),
+              borderRadius: BorderRadius.circular(10),
+            ),
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+              child: TextField(
+                controller: controller,
+                onChanged: (v) => onChanged(v),
+                decoration: const InputDecoration(
+                  border: InputBorder.none,
+                  hintText: 'Type your answer…',
+                ),
+              ),
+            ),
+          ),
+        );
+        return Column(children: children);
+      }
+
       if (question.allowMultiple) {
-        return Column(
-          children: List.generate(question.options.length, (i) {
+        children.addAll(
+          List.generate(question.options.length, (i) {
             final bool isChecked =
                 (selected is Set<int>) && (selected as Set<int>).contains(i);
             return Container(
@@ -1167,8 +1424,8 @@ class _QuestionCard extends StatelessWidget {
           }),
         );
       } else {
-        return Column(
-          children: List.generate(question.options.length, (i) {
+        children.addAll(
+          List.generate(question.options.length, (i) {
             final opt = question.options[i];
             final bool isSel = (selected is String) && selected == opt;
             return Container(
@@ -1196,11 +1453,18 @@ class _QuestionCard extends StatelessWidget {
           }),
         );
       }
+
+      return Column(children: children);
     }
 
     Widget _buildSubmitted() {
       final String chosenLabel =
           (() {
+            if (question.isText) {
+              return (selected is String && (selected as String).isNotEmpty)
+                  ? selected as String
+                  : '—';
+            }
             if (question.allowMultiple) {
               final given =
                   (selected is Set<int>) ? (selected as Set<int>) : <int>{};
@@ -1218,6 +1482,15 @@ class _QuestionCard extends StatelessWidget {
 
       final String revealLabel =
           (() {
+            if (question.isText) {
+              final pool =
+                  question.answerTexts.isNotEmpty
+                      ? question.answerTexts
+                      : (question.correctText != null
+                          ? [question.correctText!]
+                          : const <String>[]);
+              return pool.isEmpty ? '—' : pool.join(', ');
+            }
             if (question.allowMultiple) {
               return question.correctIndexes
                   .where((i) => i >= 0 && i < question.options.length)
@@ -1237,13 +1510,14 @@ class _QuestionCard extends StatelessWidget {
       return Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
+          ...media,
           Row(
             children: [
               Container(
                 padding: const EdgeInsets.all(8),
                 decoration: BoxDecoration(
                   color: (isCorrect ? Colors.green : Colors.red).withOpacity(
-                    0.12,
+                    .12,
                   ),
                   borderRadius: BorderRadius.circular(8),
                 ),
@@ -1275,7 +1549,7 @@ class _QuestionCard extends StatelessWidget {
                 const SizedBox(width: 6),
                 Expanded(
                   child: Text(
-                    'Correct answer${question.allowMultiple ? 's' : ''}: $revealLabel',
+                    'Correct answer${question.isText || question.allowMultiple ? 's' : ''}: $revealLabel',
                     style: const TextStyle(fontFamily: 'Inter', fontSize: 14),
                   ),
                 ),
@@ -1361,6 +1635,77 @@ class _QuestionCard extends StatelessWidget {
           ],
         ),
       ),
+    );
+  }
+}
+
+class _PdfInline extends StatefulWidget {
+  final String url;
+  final Color accent;
+  final VoidCallback onOpenExternally;
+
+  const _PdfInline({
+    Key? key,
+    required this.url,
+    required this.accent,
+    required this.onOpenExternally,
+  }) : super(key: key);
+
+  @override
+  State<_PdfInline> createState() => _PdfInlineState();
+}
+
+class _PdfInlineState extends State<_PdfInline> {
+  bool _open = false;
+
+  @override
+  Widget build(BuildContext context) {
+    return Column(
+      children: [
+        // External open is always available (lightweight)
+        Align(
+          alignment: Alignment.centerRight,
+          child: TextButton.icon(
+            onPressed: widget.onOpenExternally,
+            icon: const Icon(Icons.open_in_new),
+            label: const Text('Open PDF'),
+          ),
+        ),
+        // Lazy inline loader to avoid freezes
+        OutlinedButton.icon(
+          onPressed: () => setState(() => _open = !_open),
+          icon: Icon(_open ? Icons.close_fullscreen : Icons.picture_as_pdf),
+          label: Text(_open ? 'Hide PDF' : 'Show PDF (inline)'),
+          style: OutlinedButton.styleFrom(
+            foregroundColor: widget.accent,
+            side: BorderSide(color: widget.accent.withOpacity(.6)),
+          ),
+        ),
+        const SizedBox(height: 8),
+        AnimatedSwitcher(
+          duration: const Duration(milliseconds: 200),
+          child:
+              !_open
+                  ? const SizedBox.shrink()
+                  : Container(
+                    key: const ValueKey('pdf'),
+                    height: 360,
+                    decoration: BoxDecoration(
+                      border: Border.all(color: Colors.grey.shade300),
+                      borderRadius: BorderRadius.circular(10),
+                    ),
+                    child: ClipRRect(
+                      borderRadius: BorderRadius.circular(10),
+                      child: SfPdfViewer.network(
+                        widget.url,
+                        canShowScrollHead: true,
+                        canShowScrollStatus: true,
+                        enableDoubleTapZooming: true,
+                      ),
+                    ),
+                  ),
+        ),
+      ],
     );
   }
 }

@@ -256,7 +256,7 @@ class _QuizCategoriesScreenState extends State<QuizCategoriesScreen> {
         elevation: 0,
         centerTitle: true,
         title: const Text(
-          'Quiz Categories',
+          'Quizzes',
           style: TextStyle(
             fontFamily: 'Poppins',
             fontSize: 20,
