@@ -368,7 +368,7 @@ class HomeScreenState extends State<HomeScreen> {
                           SizedBox(width: 10),
                           Expanded(
                             child: Text(
-                              'Career setup complete! Your strand and course are saved.',
+                              'Career setup complete! Your track and course are saved.',
                               style: TextStyle(fontFamily: 'Inter'),
                             ),
                           ),

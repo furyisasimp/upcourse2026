@@ -222,7 +222,7 @@ class _CareerSetupPanelState extends State<CareerSetupPanel> {
             ),
           ] else
             const Text(
-              'Complete both tests to find out your recommended Academic Track and Course.',
+              'Complete both tests to find out your recommended Track and Course.',
               style: TextStyle(
                 fontFamily: 'Inter',
                 fontSize: 13,

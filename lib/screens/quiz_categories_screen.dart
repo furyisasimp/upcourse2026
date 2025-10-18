@@ -87,10 +87,21 @@ class _QuizCategoriesScreenState extends State<QuizCategoriesScreen> {
         bucket: 'quizzes',
         path: '',
       );
+
+      String _toId(String name) {
+        final base =
+            name.toLowerCase().endsWith('.json')
+                ? name.substring(0, name.length - 5)
+                : name;
+        final noPrefix =
+            base.startsWith('quiz_') ? base.substring('quiz_'.length) : base;
+        return noPrefix.toUpperCase(); // ABM, GAS, STEM, TECHPRO
+      }
+
       final ids =
           files
               .where((f) => f.toLowerCase().endsWith('.json'))
-              .map((f) => f.substring(0, f.length - 5).toUpperCase())
+              .map(_toId)
               .toSet()
               .toList();
 

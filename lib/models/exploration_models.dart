@@ -7,7 +7,8 @@ class SourceLink {
       SourceLink(name: j['name'] ?? '', url: j['url'] ?? '');
 }
 
-class Strand {
+/// Renamed + repointed from Strand -> Track
+class Track {
   final String code;
   final String name;
   final String summary;
@@ -20,7 +21,7 @@ class Strand {
   final List<String> skills;
   final List<SourceLink> sources;
 
-  Strand({
+  Track({
     required this.code,
     required this.name,
     required this.summary,
@@ -34,7 +35,7 @@ class Strand {
     required this.sources,
   });
 
-  factory Strand.fromRow(Map<String, dynamic> r) => Strand(
+  factory Track.fromRow(Map<String, dynamic> r) => Track(
     code: r['code'],
     name: r['name'] ?? '',
     summary: r['summary'] ?? '',

@@ -1,15 +1,27 @@
 // lib/quiz_screen.dart
 import 'dart:async';
+import 'dart:io' show Platform;
+import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:flutter/material.dart';
+import 'package:screen_capture_event/screen_capture_event.dart';
+
 import 'home_screen.dart';
 import 'package:career_roadmap/services/supabase_service.dart';
+import 'package:career_roadmap/services/quiz_security_service.dart';
 
 class Question {
   final String text;
   final List<String> options;
-  final int? rawIndex; // from answer_index / correct_index (unknown base)
-  final String? correctText; // from correct / answer (text)
-  final String? explanation; // optional: "explanation" key in JSON
+
+  // Single-answer legacy
+  final int? rawIndex; // from answer_index / correct_index
+  final String? correctText; // from correct / answer
+
+  // Multi-answer support
+  final bool allowMultiple; // from allow_multiple
+  final List<int> correctIndexes; // from correct_answers (0-based)
+
+  final String? explanation; // optional
 
   Question({
     required this.text,
@@ -17,6 +29,8 @@ class Question {
     this.rawIndex,
     this.correctText,
     this.explanation,
+    this.allowMultiple = false,
+    this.correctIndexes = const <int>[],
   });
 
   factory Question.fromJson(Map<String, dynamic> json) {
@@ -26,6 +40,15 @@ class Question {
     final dynamic txtRaw = json['correct'] ?? json['answer'];
     final String? txt =
         (txtRaw is String && txtRaw.trim().isNotEmpty) ? txtRaw.trim() : null;
+
+    final bool multi = json['allow_multiple'] == true;
+    final List<int> idxs =
+        (json['correct_answers'] is List)
+            ? (json['correct_answers'] as List)
+                .where((e) => e is num)
+                .map((e) => (e as num).toInt())
+                .toList()
+            : const <int>[];
 
     return Question(
       text: (json['text'] ?? '').toString(),
@@ -37,10 +60,11 @@ class Question {
                   (json['explanation'] as String).trim().isNotEmpty)
               ? (json['explanation'] as String).trim()
               : null,
+      allowMultiple: multi,
+      correctIndexes: idxs,
     );
   }
 
-  /// Try to normalize the index into 0-based within options length.
   int? correctIndex0() {
     if (rawIndex == null) return null;
     final n = options.length;
@@ -53,8 +77,7 @@ class Question {
 }
 
 class QuizScreen extends StatefulWidget {
-  /// Accepts legacy ids (e.g., "abm_stats") or new ids ("ABM", "GAS", "STEM", "TECHPRO")
-  final String categoryId;
+  final String categoryId; // legacy or ABM/GAS/STEM/TECHPRO
   const QuizScreen({Key? key, required this.categoryId}) : super(key: key);
 
   @override
@@ -62,7 +85,7 @@ class QuizScreen extends StatefulWidget {
 }
 
 class _QuizScreenState extends State<QuizScreen> {
-  // --- Category metadata (UI) ---
+  // --- Category meta (UI)
   static const _categoryMeta = {
     'ABM': (
       title: 'ABM — Business & Finance',
@@ -95,8 +118,9 @@ class _QuizScreenState extends State<QuizScreen> {
     return id.toUpperCase();
   }
 
-  // --- State ---
-  final Map<int, String> _answers = {}; // index -> chosen text
+  // --- State
+  // String for single-answer, Set<int> for multi-answer questions
+  final Map<int, dynamic> _answers = {};
   final List<Question> _questions = [];
   final List<GlobalKey> _qKeys = [];
   final ScrollController _scroll = ScrollController();
@@ -106,10 +130,10 @@ class _QuizScreenState extends State<QuizScreen> {
   String? _loadError;
 
   // gating
-  bool _blocked = false; // true if retake is not allowed
+  bool _blocked = false;
   String? _blockReason;
 
-  // scoring snapshot after submit
+  // scoring
   int _correct = 0;
   int _total = 0;
   int _scorePct = 0;
@@ -119,43 +143,201 @@ class _QuizScreenState extends State<QuizScreen> {
   int _elapsedSec = 0;
   Timer? _ticker;
 
+  // --- Anti-cheat (plugin is platform-gated)
+  ScreenCaptureEvent? _screenCapture;
+  int _cheatStrikes = 0;
+  static const int _cheatMax = 3;
+  bool _securityBusy = false; // debounce for security snackbars
+  bool _leaving = false; // guard against late events while exiting
+
+  // Cached messenger to avoid context lookups in dispose
+  ScaffoldMessengerState? _scaffoldMessenger;
+
+  bool get _supportsScreenCapture =>
+      !kIsWeb && (Platform.isAndroid || Platform.isIOS || Platform.isMacOS);
+  // Windows/Linux are explicitly NOT supported by the plugin.
+
   @override
   void initState() {
     super.initState();
+    if (_supportsScreenCapture) {
+      _screenCapture = ScreenCaptureEvent();
+      _initScreenCapture();
+    }
     _checkGateAndLoad();
   }
 
   @override
   void dispose() {
     _ticker?.cancel();
+    _screenCapture?.dispose(); // safe: only when created
     _scroll.dispose();
+    _scaffoldMessenger?.clearSnackBars(); // no context lookup here
     super.dispose();
   }
 
-  Future<void> _checkGateAndLoad() async {
-    setState(() {
-      _loading = true;
-      _blocked = false;
-      _blockReason = null;
-      _loadError = null;
+  // Stop all transient activity before leaving the route.
+  void _prepareForExit() {
+    _leaving = true; // tells listeners to ignore
+    _ticker?.cancel();
+    _scaffoldMessenger ??= ScaffoldMessenger.maybeOf(context);
+    _scaffoldMessenger?.clearSnackBars();
+  }
+
+  Future<void> _initScreenCapture() async {
+    try {
+      final prior = await QuizSecurityService.getStrikes(_programId);
+      final locked = await QuizSecurityService.isLocked(_programId);
+      if (!mounted) return;
+      setState(() {
+        _cheatStrikes = prior;
+        if (locked) {
+          _blocked = true;
+          _blockReason =
+              'This quiz is locked due to prior security violations.';
+          _loading = false;
+        }
+      });
+      if (locked) return;
+    } catch (_) {
+      // ignore – fail-open
+    }
+
+    // Listeners exist ONLY when plugin is supported
+    _screenCapture?.addScreenShotListener((_) {
+      _handleSecurityEvent('screenshot');
     });
+
+    _screenCapture?.addScreenRecordListener((isRecording) {
+      if (isRecording == true) {
+        _handleSecurityEvent('screen_record_start');
+      }
+    });
+  }
+
+  Future<void> _handleSecurityEvent(String kind) async {
+    if (!mounted || _submitted || _blocked || _securityBusy || _leaving) return;
+
+    _securityBusy = true;
+    final next = _cheatStrikes + 1;
+    final willLock = next >= _cheatMax;
+
+    try {
+      try {
+        await QuizSecurityService.recordStrike(
+          quizId: _programId,
+          strikes: next,
+          lock: willLock,
+          meta: {
+            'kind': kind,
+            'at': DateTime.now().toIso8601String(),
+            'app': 'mobile',
+            'screen': 'QuizScreen',
+          },
+        );
+      } catch (_) {}
+
+      if (!mounted || _leaving) return;
+      setState(() => _cheatStrikes = next);
+
+      if (willLock) {
+        if (!mounted || _leaving) return;
+        setState(() {
+          _blocked = true;
+          _blockReason =
+              'Quiz locked: 3 security violations detected (screenshots/recording).';
+        });
+        if (!mounted || _leaving) return;
+        await showDialog<void>(
+          context: context,
+          barrierDismissible: false,
+          builder:
+              (ctx) => AlertDialog(
+                shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(14),
+                ),
+                title: const Text(
+                  'Quiz Locked',
+                  style: TextStyle(
+                    fontFamily: 'Poppins',
+                    fontWeight: FontWeight.w700,
+                  ),
+                ),
+                content: const Text(
+                  'Multiple screen capture attempts were detected. This quiz is now locked.',
+                  style: TextStyle(fontFamily: 'Inter'),
+                ),
+                actions: [
+                  TextButton(
+                    onPressed: () => Navigator.pop(ctx),
+                    child: const Text(
+                      'OK',
+                      style: TextStyle(fontFamily: 'Inter'),
+                    ),
+                  ),
+                ],
+              ),
+        );
+      } else {
+        if (!mounted || _leaving) return;
+        final remaining = (_cheatMax - next).clamp(0, _cheatMax);
+        _scaffoldMessenger ??= ScaffoldMessenger.maybeOf(context);
+        _scaffoldMessenger?.showSnackBar(
+          SnackBar(
+            behavior: SnackBarBehavior.floating,
+            backgroundColor: Colors.redAccent,
+            content: Text(
+              '⚠️ Screenshot detected. '
+              '${remaining == 0 ? 'Next will lock the quiz.' : '$remaining strike${remaining == 1 ? '' : 's'} left.'}',
+              style: const TextStyle(fontFamily: 'Inter'),
+            ),
+          ),
+        );
+      }
+    } finally {
+      _securityBusy = false;
+    }
+  }
+
+  Future<void> _checkGateAndLoad() async {
+    if (mounted) {
+      setState(() {
+        _loading = true;
+        _blocked = false;
+        _blockReason = null;
+        _loadError = null;
+      });
+    }
 
     try {
       final allowed = await SupabaseService.canTakeQuiz(_programId);
+      if (!mounted) return;
       if (!allowed) {
         setState(() {
           _loading = false;
           _blocked = true;
-          _blockReason = 'You have already taken this quiz.';
+          _blockReason = 'This quiz is locked (completed or restricted).';
         });
         return;
       }
 
-      // Load bank + TOS selection from Supabase Storage (always ~10 items)
+      final cheatLocked = await QuizSecurityService.isLocked(_programId);
+      if (!mounted) return;
+      if (cheatLocked) {
+        setState(() {
+          _loading = false;
+          _blocked = true;
+          _blockReason =
+              'This quiz is locked due to prior security violations.';
+        });
+        return;
+      }
+
       final selected = await SupabaseService.fetchQuizWithTOS(
-        quizId: _programId, // ABM / GAS / STEM / TECHPRO
+        quizId: _programId,
         bucket: 'quizzes',
       );
+      if (!mounted) return;
 
       if (selected.isEmpty) {
         throw Exception('Quiz is empty for $_programId');
@@ -170,21 +352,23 @@ class _QuizScreenState extends State<QuizScreen> {
         ..clear()
         ..addAll(List.generate(_questions.length, (_) => GlobalKey()));
 
-      // Start timer
       _ticker?.cancel();
       _elapsedSec = 0;
       _ticker = Timer.periodic(const Duration(seconds: 1), (_) {
-        if (!_submitted) {
-          setState(() {
-            _elapsedSec = DateTime.now().difference(_startedAt).inSeconds;
-          });
-        } else {
+        if (!mounted || _leaving) return;
+        if (_submitted) {
           _ticker?.cancel();
+          return;
         }
+        setState(() {
+          _elapsedSec = DateTime.now().difference(_startedAt).inSeconds;
+        });
       });
 
+      if (!mounted) return;
       setState(() => _loading = false);
     } catch (e) {
+      if (!mounted) return;
       setState(() {
         _loading = false;
         _loadError = e.toString();
@@ -192,17 +376,32 @@ class _QuizScreenState extends State<QuizScreen> {
     }
   }
 
-  String _canon(String? s) => (s ?? '').trim().toLowerCase();
+  String _canon(String? s) {
+    final t = (s ?? '').trim().toLowerCase();
+    final squashed = t.replaceAll(RegExp(r'\s+'), ' ');
+    final stripped = squashed.replaceAll(RegExp(r'[^\w\s]'), '');
+    return stripped;
+  }
+
+  bool _isAnswered(int i) {
+    final a = _answers[i];
+    if (a == null) return false;
+    if (a is String) return a.trim().isNotEmpty;
+    if (a is Set<int>) return a.isNotEmpty;
+    return false;
+  }
 
   Future<void> _submit() async {
-    if (_answers.length != _questions.length) {
-      // Jump to first unanswered to help the user
+    if (_answers.length != _questions.length ||
+        !_questions.asMap().keys.every(_isAnswered)) {
       final firstUnanswered = List.generate(
         _questions.length,
         (i) => i,
-      ).firstWhere((i) => !_answers.containsKey(i), orElse: () => 0);
+      ).firstWhere((i) => !_isAnswered(i), orElse: () => 0);
       _scrollTo(firstUnanswered);
-      ScaffoldMessenger.of(context).showSnackBar(
+      if (!mounted) return;
+      _scaffoldMessenger ??= ScaffoldMessenger.maybeOf(context);
+      _scaffoldMessenger?.showSnackBar(
         const SnackBar(
           content: Text(
             'Please answer all questions before submitting.',
@@ -215,20 +414,45 @@ class _QuizScreenState extends State<QuizScreen> {
 
     int correct = 0;
     final Map<int, int> chosenIndexes = {};
+    final Map<int, List<int>> chosenMulti = {};
+
     for (var i = 0; i < _questions.length; i++) {
       final q = _questions[i];
-      final selectedText = _canon(_answers[i]);
-      final selIdx = q.options.indexWhere((o) => _canon(o) == selectedText);
-      if (selIdx >= 0) chosenIndexes[i] = selIdx;
+      final ans = _answers[i];
 
-      bool isRight = false;
-      final idx0 = q.correctIndex0();
-      if (idx0 != null) {
-        isRight = selIdx == idx0;
-      } else if (q.correctText != null) {
-        isRight = selectedText == _canon(q.correctText);
+      if (q.allowMultiple) {
+        final Set<int> given = (ans is Set<int>) ? ans : <int>{};
+        final Set<int> correctSet = q.correctIndexes.toSet();
+
+        if (given.isNotEmpty) {
+          chosenIndexes[i] = given.first;
+          final list = given.toList()..sort();
+          chosenMulti[i] = list;
+        }
+
+        final isRight =
+            given.isNotEmpty &&
+            given.length == correctSet.length &&
+            given.intersection(correctSet).length == correctSet.length;
+
+        if (isRight) correct++;
+      } else {
+        final selectedText = _canon(ans is String ? ans : '');
+        final selIdx = q.options.indexWhere((o) => _canon(o) == selectedText);
+        if (selIdx >= 0) {
+          chosenIndexes[i] = selIdx;
+          chosenMulti[i] = [selIdx];
+        }
+
+        bool isRight = false;
+        final idx0 = q.correctIndex0();
+        if (idx0 != null) {
+          isRight = selIdx == idx0;
+        } else if (q.correctText != null) {
+          isRight = selectedText == _canon(q.correctText);
+        }
+        if (isRight) correct++;
       }
-      if (isRight) correct++;
     }
 
     final total = _questions.length;
@@ -241,6 +465,7 @@ class _QuizScreenState extends State<QuizScreen> {
         status: 'completed',
         score: scorePct,
         answers: chosenIndexes,
+        answersMulti: chosenMulti,
       );
     } catch (_) {}
 
@@ -254,6 +479,7 @@ class _QuizScreenState extends State<QuizScreen> {
       );
     } catch (_) {}
 
+    if (!mounted) return;
     setState(() {
       _submitted = true;
       _correct = correct;
@@ -262,15 +488,13 @@ class _QuizScreenState extends State<QuizScreen> {
       _elapsedSec = elapsed;
     });
 
-    if (mounted) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          content: Text(
-            'Score: $correct/$total ($_scorePct%) • ${_elapsedSec}s',
-          ),
-        ),
-      );
-    }
+    if (!mounted) return;
+    _scaffoldMessenger ??= ScaffoldMessenger.maybeOf(context);
+    _scaffoldMessenger?.showSnackBar(
+      SnackBar(
+        content: Text('Score: $correct/$total ($_scorePct%) • ${_elapsedSec}s'),
+      ),
+    );
   }
 
   void _scrollTo(int index) {
@@ -288,6 +512,8 @@ class _QuizScreenState extends State<QuizScreen> {
   }
 
   void _returnHome() {
+    if (!mounted) return;
+    _prepareForExit();
     Navigator.pushAndRemoveUntil(
       context,
       MaterialPageRoute(builder: (_) => const HomeScreen()),
@@ -297,6 +523,7 @@ class _QuizScreenState extends State<QuizScreen> {
 
   Future<bool> _confirmExit() async {
     if (_submitted) return true;
+    if (!mounted) return true;
     final shouldExit = await showDialog<bool>(
       context: context,
       barrierDismissible: false,
@@ -313,7 +540,7 @@ class _QuizScreenState extends State<QuizScreen> {
               ),
             ),
             content: const Text(
-              'If you leave now, your answers will not be submitted. Are you sure you want to exit?',
+              'If you leave now, your answers will not be saved. Are you sure you want to exit?',
               style: TextStyle(fontFamily: 'Inter'),
             ),
             actionsPadding: const EdgeInsets.symmetric(
@@ -324,7 +551,7 @@ class _QuizScreenState extends State<QuizScreen> {
               TextButton(
                 onPressed: () => Navigator.pop(ctx, false),
                 child: const Text(
-                  'Continue Quiz',
+                  'Continue',
                   style: TextStyle(
                     fontFamily: 'Inter',
                     color: Color(0xFF3EB6FF),
@@ -351,6 +578,17 @@ class _QuizScreenState extends State<QuizScreen> {
     return shouldExit ?? false;
   }
 
+  // Kick off the confirm dialog & safely pop after quiescing the page.
+  Future<void> _requestExit() async {
+    if (!mounted) return;
+    final ok = await _confirmExit();
+    if (!mounted) return;
+    if (ok) {
+      _prepareForExit();
+      if (context.mounted) Navigator.pop(context);
+    }
+  }
+
   (List<Color> colors, IconData icon, String title) _meta() {
     final meta = _categoryMeta[_programId];
     if (meta != null) return (meta.colors, meta.icon, meta.title);
@@ -364,11 +602,19 @@ class _QuizScreenState extends State<QuizScreen> {
   @override
   Widget build(BuildContext context) {
     final (colors, icon, titleText) = _meta();
-    final answered = _answers.length;
+    _scaffoldMessenger ??= ScaffoldMessenger.maybeOf(context);
+
+    final answered =
+        _answers.entries.where((e) {
+          final v = e.value;
+          if (v is String) return v.trim().isNotEmpty;
+          if (v is Set<int>) return v.isNotEmpty;
+          return false;
+        }).length;
+
     final total = _questions.length;
     final progress = total == 0 ? 0.0 : answered / total;
 
-    // Responsive paddings
     final width = MediaQuery.of(context).size.width;
     final hPad =
         width >= 1100
@@ -377,8 +623,11 @@ class _QuizScreenState extends State<QuizScreen> {
             ? 18.0
             : 12.0;
 
-    return WillPopScope(
-      onWillPop: _confirmExit,
+    return PopScope(
+      canPop: false,
+      onPopInvoked: (didPop) {
+        if (!didPop) _requestExit();
+      },
       child: Scaffold(
         backgroundColor: const Color(0xFFF7FBFF),
         appBar: AppBar(
@@ -408,14 +657,10 @@ class _QuizScreenState extends State<QuizScreen> {
                   ? null
                   : IconButton(
                     icon: const Icon(Icons.arrow_back, color: Colors.white),
-                    onPressed: () async {
-                      final ok = await _confirmExit();
-                      if (ok && mounted) Navigator.pop(context);
-                    },
+                    onPressed: _requestExit,
                   ),
         ),
 
-        // Bottom submit
         bottomNavigationBar:
             _loading || _submitted || _questions.isEmpty || _blocked
                 ? null
@@ -438,9 +683,7 @@ class _QuizScreenState extends State<QuizScreen> {
                           ),
                         ),
                         onPressed:
-                            _answers.length == _questions.length
-                                ? _submit
-                                : null,
+                            answered == _questions.length ? _submit : null,
                         style: ElevatedButton.styleFrom(
                           backgroundColor: Colors.black87,
                           disabledBackgroundColor: Colors.black26,
@@ -471,7 +714,6 @@ class _QuizScreenState extends State<QuizScreen> {
                 ? const _EmptyState()
                 : Column(
                   children: [
-                    // Header: progress / timer + quick index bar
                     Padding(
                       padding: EdgeInsets.fromLTRB(hPad, 16, hPad, 8),
                       child: _HeaderCard(
@@ -497,7 +739,43 @@ class _QuizScreenState extends State<QuizScreen> {
                       ),
                     ),
 
-                    // Quick index: jump to questions
+                    if (!_submitted && !_blocked && _cheatStrikes > 0)
+                      Padding(
+                        padding: EdgeInsets.fromLTRB(hPad, 8, hPad, 0),
+                        child: Container(
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 12,
+                            vertical: 10,
+                          ),
+                          decoration: BoxDecoration(
+                            color: const Color(0xFFFFE0E0),
+                            borderRadius: BorderRadius.circular(12),
+                            border: Border.all(
+                              color: Colors.redAccent.withOpacity(0.35),
+                            ),
+                          ),
+                          child: Row(
+                            children: [
+                              const Icon(
+                                Icons.warning_amber_rounded,
+                                color: Colors.redAccent,
+                              ),
+                              const SizedBox(width: 8),
+                              Expanded(
+                                child: Text(
+                                  'Security warning: $_cheatStrikes/$_cheatMax '
+                                  '${_cheatStrikes >= _cheatMax - 1 ? '— Next violation will lock the quiz.' : '— Avoid screenshots or recording.'}',
+                                  style: const TextStyle(
+                                    fontFamily: 'Inter',
+                                    fontWeight: FontWeight.w600,
+                                  ),
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                      ),
+
                     if (_questions.isNotEmpty)
                       Padding(
                         padding: EdgeInsets.fromLTRB(hPad, 4, hPad, 6),
@@ -509,24 +787,37 @@ class _QuizScreenState extends State<QuizScreen> {
                           isCorrect: (i) {
                             if (!_submitted) return null;
                             final q = _questions[i];
-                            final sel = _answers[i];
-                            if (sel == null) return false;
-                            final idx0 = q.correctIndex0();
-                            if (idx0 != null) {
-                              final si = q.options.indexWhere(
-                                (o) => _canon(o) == _canon(sel),
-                              );
-                              return si == idx0;
-                            } else if (q.correctText != null) {
-                              return _canon(sel) == _canon(q.correctText);
+                            final ans = _answers[i];
+                            if (ans == null) return false;
+
+                            if (q.allowMultiple) {
+                              final Set<int> given =
+                                  (ans is Set<int>) ? ans : <int>{};
+                              final Set<int> correctSet =
+                                  q.correctIndexes.toSet();
+                              return given.isNotEmpty &&
+                                  given.length == correctSet.length &&
+                                  given.intersection(correctSet).length ==
+                                      correctSet.length;
+                            } else {
+                              final idx0 = q.correctIndex0();
+                              if (idx0 != null) {
+                                if (ans is! String) return false;
+                                final si = q.options.indexWhere(
+                                  (o) => _canon(o) == _canon(ans),
+                                );
+                                return si == idx0;
+                              } else if (q.correctText != null &&
+                                  ans is String) {
+                                return _canon(ans) == _canon(q.correctText);
+                              }
+                              return false;
                             }
-                            return false;
                           },
                           onTap: _scrollTo,
                         ),
                       ),
 
-                    // Questions
                     Expanded(
                       child: ListView.builder(
                         controller: _scroll,
@@ -642,9 +933,7 @@ class _HeaderCard extends StatelessWidget {
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
                 Text(
-                  submitted
-                      ? '$label  •  ${_fmtTime(elapsedSec)}'
-                      : '$label  •  ${_fmtTime(elapsedSec)}',
+                  '$label  •  ${_fmtTime(elapsedSec)}',
                   style: const TextStyle(
                     fontFamily: 'Poppins',
                     fontSize: 14,
@@ -701,7 +990,7 @@ class _IndexBar extends StatelessWidget {
   final int count;
   final bool isSubmitted;
   final Color color;
-  final Map<int, String> answered;
+  final Map<int, dynamic> answered; // String or Set<int>
   final bool? Function(int i) isCorrect;
   final void Function(int i) onTap;
 
@@ -714,6 +1003,12 @@ class _IndexBar extends StatelessWidget {
     required this.onTap,
   });
 
+  bool _hasAnswer(dynamic v) {
+    if (v is String) return v.trim().isNotEmpty;
+    if (v is Set<int>) return v.isNotEmpty;
+    return false;
+  }
+
   @override
   Widget build(BuildContext context) {
     return SizedBox(
@@ -723,7 +1018,7 @@ class _IndexBar extends StatelessWidget {
         itemCount: count,
         separatorBuilder: (_, __) => const SizedBox(width: 8),
         itemBuilder: (context, i) {
-          final answeredFlag = answered.containsKey(i);
+          final answeredFlag = _hasAnswer(answered[i]);
           final correctness = isSubmitted ? isCorrect(i) : null;
 
           Color bg;
@@ -769,10 +1064,11 @@ class _IndexBar extends StatelessWidget {
 class _QuestionCard extends StatelessWidget {
   final int index;
   final Question question;
-  final String? selected;
+  final dynamic selected; // String or Set<int>
   final bool submitted;
   final Color accent;
-  final ValueChanged<String> onChanged;
+  final ValueChanged<dynamic>
+  onChanged; // String for single, Set<int> for multi
 
   const _QuestionCard({
     required this.index,
@@ -783,11 +1079,21 @@ class _QuestionCard extends StatelessWidget {
     required this.onChanged,
   });
 
-  String _canon(String? s) => (s ?? '').trim().toLowerCase();
+  String _canon(String? s) {
+    final t = (s ?? '').trim().toLowerCase();
+    final squashed = t.replaceAll(RegExp(r'\s+'), ' ');
+    final stripped = squashed.replaceAll(RegExp(r'[^\w\s]'), '');
+    return stripped;
+  }
 
   @override
   Widget build(BuildContext context) {
-    final hasAnswer = selected != null && selected!.isNotEmpty;
+    final bool hasAnswer =
+        (() {
+          if (selected is String) return (selected as String).trim().isNotEmpty;
+          if (selected is Set<int>) return (selected as Set<int>).isNotEmpty;
+          return false;
+        })();
 
     final int? idx0 = question.correctIndex0();
     final String? correctByIndex =
@@ -796,16 +1102,206 @@ class _QuestionCard extends StatelessWidget {
             : null;
     final String? correctText = question.correctText ?? correctByIndex;
 
-    final bool isCorrect =
-        submitted &&
-        hasAnswer &&
-        ((idx0 != null &&
-                question.options.indexWhere(
-                      (o) => _canon(o) == _canon(selected),
-                    ) ==
-                    idx0) ||
-            (question.correctText != null &&
-                _canon(selected) == _canon(question.correctText)));
+    bool computeCorrect(dynamic sel) {
+      if (!submitted || !hasAnswer) return false;
+      if (question.allowMultiple) {
+        final Set<int> given = (sel is Set<int>) ? sel : <int>{};
+        final Set<int> correctSet = question.correctIndexes.toSet();
+        return given.isNotEmpty &&
+            given.length == correctSet.length &&
+            given.intersection(correctSet).length == correctSet.length;
+      } else {
+        if (idx0 != null) {
+          final si = question.options.indexWhere(
+            (o) => _canon(o) == _canon(sel as String?),
+          );
+          return si == idx0;
+        } else if (question.correctText != null && sel is String) {
+          return _canon(sel) == _canon(question.correctText);
+        }
+        return false;
+      }
+    }
+
+    final bool isCorrect = computeCorrect(selected);
+
+    Widget _buildUnsubmitted() {
+      if (question.allowMultiple) {
+        return Column(
+          children: List.generate(question.options.length, (i) {
+            final bool isChecked =
+                (selected is Set<int>) && (selected as Set<int>).contains(i);
+            return Container(
+              margin: const EdgeInsets.symmetric(vertical: 6),
+              decoration: BoxDecoration(
+                color:
+                    isChecked ? accent.withOpacity(0.08) : Colors.transparent,
+                borderRadius: BorderRadius.circular(10),
+                border: Border.all(
+                  color: isChecked ? accent : Colors.grey.shade300,
+                ),
+              ),
+              child: CheckboxListTile(
+                value: isChecked,
+                onChanged: (v) {
+                  final current =
+                      (selected is Set<int>)
+                          ? Set<int>.from(selected as Set<int>)
+                          : <int>{};
+                  if (v == true) {
+                    current.add(i);
+                  } else {
+                    current.remove(i);
+                  }
+                  onChanged(current);
+                },
+                dense: true,
+                activeColor: accent,
+                contentPadding: const EdgeInsets.symmetric(horizontal: 10),
+                title: Text(
+                  question.options[i],
+                  style: const TextStyle(fontFamily: 'Inter', fontSize: 15),
+                ),
+              ),
+            );
+          }),
+        );
+      } else {
+        return Column(
+          children: List.generate(question.options.length, (i) {
+            final opt = question.options[i];
+            final bool isSel = (selected is String) && selected == opt;
+            return Container(
+              margin: const EdgeInsets.symmetric(vertical: 6),
+              decoration: BoxDecoration(
+                color: isSel ? accent.withOpacity(0.08) : Colors.transparent,
+                borderRadius: BorderRadius.circular(10),
+                border: Border.all(
+                  color: isSel ? accent : Colors.grey.shade300,
+                ),
+              ),
+              child: RadioListTile<String>(
+                value: opt,
+                groupValue: (selected is String) ? selected as String? : null,
+                onChanged: (v) => onChanged(v!),
+                dense: true,
+                activeColor: accent,
+                contentPadding: const EdgeInsets.symmetric(horizontal: 10),
+                title: Text(
+                  opt,
+                  style: const TextStyle(fontFamily: 'Inter', fontSize: 15),
+                ),
+              ),
+            );
+          }),
+        );
+      }
+    }
+
+    Widget _buildSubmitted() {
+      final String chosenLabel =
+          (() {
+            if (question.allowMultiple) {
+              final given =
+                  (selected is Set<int>) ? (selected as Set<int>) : <int>{};
+              if (given.isEmpty) return '—';
+              return given
+                  .where((i) => i >= 0 && i < question.options.length)
+                  .map((i) => question.options[i])
+                  .join(', ');
+            } else {
+              return (selected is String && (selected as String).isNotEmpty)
+                  ? selected as String
+                  : '—';
+            }
+          })();
+
+      final String revealLabel =
+          (() {
+            if (question.allowMultiple) {
+              return question.correctIndexes
+                  .where((i) => i >= 0 && i < question.options.length)
+                  .map((i) => question.options[i])
+                  .join(', ');
+            } else {
+              final idx0 = question.correctIndex0();
+              if (idx0 != null && idx0 >= 0 && idx0 < question.options.length) {
+                return question.options[idx0];
+              }
+              return correctText ?? '—';
+            }
+          })();
+
+      final bool showReveal = !isCorrect;
+
+      return Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Container(
+                padding: const EdgeInsets.all(8),
+                decoration: BoxDecoration(
+                  color: (isCorrect ? Colors.green : Colors.red).withOpacity(
+                    0.12,
+                  ),
+                  borderRadius: BorderRadius.circular(8),
+                ),
+                child: Icon(
+                  isCorrect ? Icons.check : Icons.close,
+                  color: isCorrect ? Colors.green : Colors.red,
+                ),
+              ),
+              const SizedBox(width: 10),
+              Expanded(
+                child: Text(
+                  chosenLabel,
+                  style: TextStyle(
+                    fontFamily: 'Inter',
+                    fontSize: 16,
+                    fontWeight: FontWeight.w600,
+                    color: isCorrect ? Colors.green : Colors.red,
+                  ),
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 10),
+          if (showReveal)
+            Row(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Icon(Icons.lightbulb_outline, size: 18, color: accent),
+                const SizedBox(width: 6),
+                Expanded(
+                  child: Text(
+                    'Correct answer${question.allowMultiple ? 's' : ''}: $revealLabel',
+                    style: const TextStyle(fontFamily: 'Inter', fontSize: 14),
+                  ),
+                ),
+              ],
+            ),
+          if (question.explanation != null) ...[
+            const SizedBox(height: 8),
+            Row(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: const [
+                Icon(Icons.menu_book_outlined, size: 18, color: Colors.black54),
+                SizedBox(width: 6),
+              ],
+            ),
+            Text(
+              question.explanation!,
+              style: const TextStyle(
+                fontFamily: 'Inter',
+                fontSize: 13.5,
+                color: Colors.black87,
+              ),
+            ),
+          ],
+        ],
+      );
+    }
 
     return Container(
       margin: const EdgeInsets.symmetric(vertical: 8),
@@ -826,7 +1322,6 @@ class _QuestionCard extends StatelessWidget {
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            // Title row
             Row(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
@@ -862,112 +1357,7 @@ class _QuestionCard extends StatelessWidget {
               ],
             ),
             const SizedBox(height: 10),
-
-            // Body
-            if (!submitted)
-              ...question.options.map(
-                (opt) => Container(
-                  margin: const EdgeInsets.symmetric(vertical: 6),
-                  decoration: BoxDecoration(
-                    color:
-                        selected == opt
-                            ? accent.withOpacity(0.08)
-                            : Colors.transparent,
-                    borderRadius: BorderRadius.circular(10),
-                    border: Border.all(
-                      color: selected == opt ? accent : Colors.grey.shade300,
-                    ),
-                  ),
-                  child: RadioListTile<String>(
-                    value: opt,
-                    groupValue: selected,
-                    onChanged: (v) => onChanged(v!),
-                    dense: true,
-                    activeColor: accent,
-                    contentPadding: const EdgeInsets.symmetric(horizontal: 10),
-                    title: Text(
-                      opt,
-                      style: const TextStyle(fontFamily: 'Inter', fontSize: 15),
-                    ),
-                  ),
-                ),
-              )
-            else
-              Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Row(
-                    children: [
-                      Container(
-                        padding: const EdgeInsets.all(8),
-                        decoration: BoxDecoration(
-                          color: (isCorrect ? Colors.green : Colors.red)
-                              .withOpacity(0.12),
-                          borderRadius: BorderRadius.circular(8),
-                        ),
-                        child: Icon(
-                          isCorrect ? Icons.check : Icons.close,
-                          color: isCorrect ? Colors.green : Colors.red,
-                        ),
-                      ),
-                      const SizedBox(width: 10),
-                      Expanded(
-                        child: Text(
-                          selected ?? '—',
-                          style: TextStyle(
-                            fontFamily: 'Inter',
-                            fontSize: 16,
-                            fontWeight: FontWeight.w600,
-                            color: isCorrect ? Colors.green : Colors.red,
-                          ),
-                        ),
-                      ),
-                    ],
-                  ),
-                  const SizedBox(height: 10),
-                  if (!isCorrect && correctText != null)
-                    Row(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        Icon(Icons.lightbulb_outline, size: 18, color: accent),
-                        const SizedBox(width: 6),
-                        Expanded(
-                          child: Text(
-                            'Correct answer: $correctText',
-                            style: const TextStyle(
-                              fontFamily: 'Inter',
-                              fontSize: 14,
-                            ),
-                          ),
-                        ),
-                      ],
-                    ),
-                  if (question.explanation != null) ...[
-                    const SizedBox(height: 8),
-                    Row(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        Icon(
-                          Icons.menu_book_outlined,
-                          size: 18,
-                          color: Colors.black54,
-                        ),
-                        const SizedBox(width: 6),
-                        Expanded(
-                          child: Text(
-                            question.explanation!,
-                            style: const TextStyle(
-                              fontFamily: 'Inter',
-                              fontSize: 13.5,
-                              color: Colors.black87,
-                            ),
-                          ),
-                        ),
-                      ],
-                    ),
-                  ],
-                ],
-              ),
+            if (!submitted) _buildUnsubmitted() else _buildSubmitted(),
           ],
         ),
       ),

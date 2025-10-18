@@ -1,10 +1,20 @@
 // lib/services/supabase_service.dart
-import 'dart:convert';
 import 'dart:math';
 import 'dart:typed_data';
+import 'dart:convert';
+
 import 'package:supabase_flutter/supabase_flutter.dart';
 
+// IMPORTANT: Only import Track from your models. The others are defined below.
+import 'package:career_roadmap/models/exploration_models.dart' show Track;
+
 final supa = Supabase.instance.client;
+
+// ---- tiny debug helper (optional) ----
+void _d(String msg) {
+  // ignore: avoid_print
+  print('[SupabaseService] $msg');
+}
 
 /// Table of Specifications model for fixed-count quizzes (legacy/simple).
 /// Matches files like: quizzes/<QUIZ_ID>_tos.json with keys { easy, medium, hard, total }
@@ -30,6 +40,8 @@ class QuizSpec {
 }
 
 // ==== START: Exploration models (Strand / Pathway) ====
+// Kept local so this file is self-contained for Exploration features.
+
 class SourceLink {
   final String name;
   final String url;
@@ -97,7 +109,7 @@ class Strand {
   );
 }
 
-/// Pathway row from public.pathways (kept for future use)
+/// Pathway row from public.pathways
 class Pathway {
   final String code; // e.g., BSCS, BSIT, BSA
   final String name; // display
@@ -229,26 +241,22 @@ class SupabaseService {
     final uid = authUserId;
     if (uid == null) return null;
 
-    // Pull exactly what the Profile screen needs + embedded labels.
     final row =
         await supa
             .from('users')
             .select(
               'first_name,middle_name,last_name,grade_level,school,profile_picture,'
               'strand,course,track_id,course_id,'
-              'tracks:track_id(track_name),' // embedded track label
-              'courses:course_id(name)', // embedded course label
+              'tracks:track_id(track_name),'
+              'courses:course_id(name)',
             )
             .eq('supabase_id', uid)
             .maybeSingle();
 
     if (row == null) return null;
 
-    // Normalise + make safe for the UI (everything as String),
-    // and compute robust display labels with fallbacks.
     final m = Map<String, dynamic>.from(row);
 
-    // Helper: embedded object can be a Map or a 1-row List depending on client.
     String _pluckEmbedded(Map data, String relKey, String field) {
       final rel = data[relKey];
       if (rel is Map && rel[field] != null) return rel[field].toString();
@@ -259,11 +267,9 @@ class SupabaseService {
       return '';
     }
 
-    // Prefer embedded human names…
     final trackFromRel = _pluckEmbedded(m, 'tracks', 'track_name').trim();
     final courseFromRel = _pluckEmbedded(m, 'courses', 'name').trim();
 
-    // …then fall back to IDs / legacy text if needed.
     final trackFallback =
         (m['track_id']?.toString().trim().isNotEmpty ?? false)
             ? m['track_id'].toString().trim()
@@ -275,7 +281,6 @@ class SupabaseService {
     m['course_label'] =
         (courseFromRel.isNotEmpty ? courseFromRel : courseFallback);
 
-    // Ensure all string fields the UI reads exist (avoids null noise downstream).
     for (final k in const [
       'first_name',
       'middle_name',
@@ -304,140 +309,367 @@ class SupabaseService {
     await supa.from('users').upsert(patch);
   }
 
-  // ==== START: Exploration fetchers (user strand, strands, courses/pathways) ====
-  static Future<String?> getUserStrandOrCourseCode() async {
-    final uid = authUserId;
-    if (uid == null) return null;
+  // ===== Helpers ===============================================================
 
-    final List<List<String>> columnSets = [
-      ['strand_code', 'course_code'],
-      ['strand_id', 'course_id'],
-      ['strand', 'course'],
-      ['shs_strand_code', 'course_code'],
-      ['shs_strand', 'course_code'],
-    ];
+  // Detect UUID so we can resolve users.track_id → tracks.code (e.g., TECHPRO)
+  static final RegExp _uuidRe = RegExp(
+    r'^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$',
+  );
 
-    for (final cols in columnSets) {
-      try {
-        final row =
-            await supa
-                .from('users')
-                .select(cols.join(','))
-                .eq('supabase_id', uid)
-                .maybeSingle();
-        if (row == null) continue;
-        for (final c in cols) {
-          final v = row[c];
-          if (v is String && v.trim().isNotEmpty) return v.trim();
-        }
-      } catch (_) {
-        continue;
+  /// Resolve a track UUID (or pass-through a human code).
+  static Future<String?> _resolveTrackCode(dynamic raw) async {
+    if (raw == null) return null;
+    final s = raw.toString().trim();
+    if (s.isEmpty) return null;
+
+    // If it's already a human code (TECHPRO/ACADEMIC/etc.), just use it
+    if (!_uuidRe.hasMatch(s) && s.length <= 24) return s;
+
+    // Otherwise assume UUID and look up in tracks
+    try {
+      final row =
+          await supa
+              .from('tracks')
+              .select('code, track_code')
+              .or('id.eq.$s,track_id.eq.$s') // support either PK
+              .limit(1)
+              .maybeSingle();
+
+      if (row == null) return null;
+      for (final k in const ['code', 'track_code']) {
+        final v = row[k];
+        if (v is String && v.trim().isNotEmpty) return v.trim();
       }
-    }
+    } catch (_) {}
     return null;
   }
 
-  static Future<List<Strand>> listStrands({
-    List<String> codes = const ['STEM', 'ABM', 'GAS', 'TECHPRO'],
-  }) async {
-    final sel = supa.from('v_strands_shs').select('*');
+  // ================= PATHWAYS via RPC =================
+  //
+  // Uses your SQL function: fn_pathways_for_track(p_code text)
+  // which joins strand_pathways → pathways and returns:
+  //
+  // pathway_code, match_label, name, subtitle, outcomes, entry_roles,
+  // stack_suggestions, sources
+  //
+  // Works for ANY code you pass: ACADEMIC, TECHPRO, STEM, ABM, etc.
+  static Future<List<PathwayMatch>> listPathwaysForStrand(
+    String strandOrTrackCode,
+  ) async {
+    try {
+      // Newer SDKs: rpc(...).select() returns a plain List.
+      dynamic res;
+      try {
+        res =
+            await supa
+                .rpc(
+                  'fn_pathways_for_track',
+                  params: {'p_code': strandOrTrackCode},
+                )
+                .select();
+      } catch (_) {
+        // Older SDKs: rpc(...) returns object with { data: [...] }
+        res = await supa.rpc(
+          'fn_pathways_for_track',
+          params: {'p_code': strandOrTrackCode},
+        );
+      }
 
-    List<dynamic> rows;
-    if (codes.isEmpty) {
-      rows = await sel;
-    } else if (codes.length == 1) {
-      rows = await sel.eq('strand_id', codes.first);
-    } else {
-      final orExpr = codes.map((c) => 'strand_id.eq.$c').join(',');
-      rows = await sel.or(orExpr);
+      final rows = _rowsFromRpc(res);
+
+      return rows.map((r) {
+        final path = Pathway(
+          code: (r['pathway_code'] ?? r['code'] ?? '').toString(),
+          name: (r['name'] ?? '').toString(),
+          subtitle: (r['subtitle'] ?? '').toString(),
+          outcomes: _toStringList(r['outcomes']),
+          entryRoles: _toStringList(r['entry_roles']),
+          stackSuggestions: _toStringList(r['stack_suggestions']),
+          sources: _toSources(r['sources']),
+        );
+
+        final label = (r['match_label'] ?? 'Match').toString();
+        return PathwayMatch(path, label);
+      }).toList();
+    } catch (e) {
+      _d('listPathwaysForStrand("$strandOrTrackCode") failed: $e');
+      return const [];
     }
-
-    final list = (rows as List?) ?? const [];
-    return list
-        .map((e) => Strand.fromRow(Map<String, dynamic>.from(e)))
-        .toList();
   }
 
-  static Future<Strand?> getStrandByCode(String code) async {
+  /// Alias so the rest of your app can call either name.
+  static Future<List<PathwayMatch>> listPathwaysForTrackCode(String code) =>
+      listPathwaysForStrand(code);
+
+  // ===== START: Tracks (normalized user code + catalog + courses) =============
+
+  // Common aliases → canonical codes (tweak to your data)
+  static final _CODE_MAP = <String, String>{
+    'ACAD': 'ACADEMIC',
+    'ACADTRACK': 'ACADEMIC',
+    'ACADEMIC': 'ACADEMIC',
+    'TVL': 'TECHPRO',
+    'TVLICT': 'TECHPRO',
+    'TECHPRO': 'TECHPRO',
+  };
+
+  static String _normalizeCode(String raw) {
+    final k = raw.trim().toUpperCase().replaceAll(RegExp(r'[^A-Z0-9\-]'), '');
+    return _CODE_MAP[k] ?? k;
+  }
+
+  /// Get the current user's track code. Looks in `users` first, resolves any UUID,
+  /// falls back to strand-like fields. Returns a canonical (normalized) code or null.
+  static Future<String?> getUserTrackCode() async {
+    final uid = authUserId;
+    if (uid == null) return null;
+
     try {
-      final viewRow =
+      final row =
+          await supa
+              .from('users')
+              .select('track_code, track_id, strand_code, strand_id, strand')
+              .eq('supabase_id', uid)
+              .maybeSingle();
+      if (row == null) return null;
+
+      // 1) explicit track_code wins
+      final tc = row['track_code'];
+      if (tc is String && tc.trim().isNotEmpty) {
+        return _normalizeCode(tc);
+      }
+
+      // 2) resolve UUID if present
+      final resolved = await _resolveTrackCode(row['track_id']);
+      if (resolved != null && resolved.isNotEmpty) {
+        return _normalizeCode(resolved);
+      }
+
+      // 3) fallbacks from strand-ish fields
+      for (final k in const ['strand_code', 'strand_id', 'strand']) {
+        final v = row[k];
+        if (v is String && v.trim().isNotEmpty) {
+          return _normalizeCode(v);
+        }
+      }
+    } catch (e) {
+      _d('getUserTrackCode error: $e');
+    }
+
+    return null;
+  }
+
+  /// Same as getUserTrackCode() but guarantees a code so UI can render.
+  static Future<String> getUserTrackCodeOrDefault() async {
+    final c = await getUserTrackCode();
+    if (c != null && c.isNotEmpty) return _normalizeCode(c);
+
+    // Prefer whatever exists in strands; else default to ACADEMIC.
+    try {
+      final rows = await supa.from('strands').select('code').limit(10);
+      final list = (rows as List?) ?? const [];
+      for (final r in list) {
+        final code = (r['code'] ?? '').toString().trim();
+        if (code.isNotEmpty) return _normalizeCode(code);
+      }
+    } catch (_) {}
+    return 'ACADEMIC';
+  }
+
+  /// Load a Track object by any of: track_code, track_id (UUID), or strand code.
+  static Future<Track?> getTrackByCode(String codeOrId) async {
+    final probe = codeOrId.trim();
+    if (probe.isEmpty) return null;
+
+    final normalized = _normalizeCode(probe);
+
+    // 1) tracks (canonical)
+    try {
+      final r =
+          await supa
+              .from('tracks')
+              .select('*')
+              .or(
+                'track_code.eq.$normalized,code.eq.$normalized,track_id.eq.$probe',
+              )
+              .limit(1)
+              .maybeSingle();
+      if (r != null) {
+        return Track.fromRow(_coerceTrackRow(Map<String, dynamic>.from(r)));
+      }
+    } catch (_) {}
+
+    // 2) optional view
+    try {
+      final r =
+          await supa
+              .from('v_tracks_shs')
+              .select('*')
+              .or(
+                'track_code.eq.$normalized,code.eq.$normalized,track_id.eq.$probe',
+              )
+              .limit(1)
+              .maybeSingle();
+      if (r != null) {
+        return Track.fromRow(_coerceTrackRow(Map<String, dynamic>.from(r)));
+      }
+    } catch (_) {}
+
+    // 3) strands (fallback-as-tracks)
+    try {
+      final r =
+          await supa
+              .from('strands')
+              .select('*')
+              .or('code.eq.$normalized,id.eq.$probe')
+              .limit(1)
+              .maybeSingle();
+      if (r != null) {
+        return Track.fromRow(_coerceTrackRow(Map<String, dynamic>.from(r)));
+      }
+    } catch (_) {}
+
+    // 4) optional view
+    try {
+      final r =
           await supa
               .from('v_strands_shs')
               .select('*')
-              .eq('strand_id', code)
+              .or('code.eq.$normalized,strand_id.eq.$probe')
+              .limit(1)
               .maybeSingle();
-      if (viewRow != null) {
-        return Strand.fromRow(Map<String, dynamic>.from(viewRow));
+      if (r != null) {
+        return Track.fromRow(_coerceTrackRow(Map<String, dynamic>.from(r)));
       }
     } catch (_) {}
-    final tblRow =
-        await supa.from('strands').select('*').eq('code', code).maybeSingle();
-    if (tblRow == null) return null;
-    return Strand.fromRow(Map<String, dynamic>.from(tblRow));
+
+    return null;
   }
 
-  static Future<List<Map<String, dynamic>>> listCoursesForStrandCode(
-    String strandCode,
-  ) async {
-    final rows = await supa
-        .from('courses')
-        .select(
-          'course_id,name,summary,tags,sources,riasec_primary,strand_id,active',
-        )
-        .eq('strand_id', strandCode)
-        .eq('active', true)
-        .order('name');
-    return (rows as List?)?.cast<Map<String, dynamic>>() ?? const [];
-  }
+  /// List available tracks for “Recommended Tracks”.
+  /// Prefer `strands` (ACADEMIC/TECHPRO) and fall back gracefully.
+  static Future<List<Track>> listTracks() async {
+    // 1) Prefer strands table – explicit ACADEMIC/TECHPRO if present
+    try {
+      final rows = await supa
+          .from('strands')
+          .select('*')
+          .or(_orEq('code', const ['ACADEMIC', 'TECHPRO']))
+          .order('name', ascending: true);
 
-  static Future<List<PathwayMatch>> listPathwaysForStrand(
-    String strandCode,
-  ) async {
-    final links = await supa
-        .from('strand_pathways')
-        .select('pathway_code, match_label, sort_order')
-        .eq('strand_code', strandCode)
-        .order('sort_order', ascending: true);
-
-    final linkList = (links as List?) ?? const [];
-    if (linkList.isEmpty) return const [];
-
-    final codes =
-        linkList
-            .map((e) => (e as Map)['pathway_code']?.toString())
-            .where((e) => e != null && e.isNotEmpty)
-            .cast<String>()
+      final list = (rows as List?) ?? const [];
+      if (list.isNotEmpty) {
+        return list
+            .map(
+              (e) =>
+                  Track.fromRow(_coerceTrackRow(Map<String, dynamic>.from(e))),
+            )
             .toList();
-
-    if (codes.isEmpty) return const [];
-
-    final query = supa.from('pathways').select('*');
-    List<dynamic> rows;
-    if (codes.length == 1) {
-      rows = await query.eq('code', codes.first);
-    } else {
-      final orExpr = codes.map((c) => 'code.eq.$c').join(',');
-      rows = await query.or(orExpr);
+      }
+    } catch (e) {
+      // ignore: avoid_print
+      print('listTracks strands(filtered) error: $e');
     }
 
-    final byCode = <String, Pathway>{
-      for (final r in ((rows as List?) ?? const []))
-        (r as Map)['code'].toString(): Pathway.fromRow(
-          Map<String, dynamic>.from(r),
-        ),
-    };
+    // 2) All strands
+    try {
+      final rows = await supa
+          .from('strands')
+          .select('*')
+          .order('name', ascending: true);
 
-    final out = <PathwayMatch>[];
-    for (final l in linkList) {
-      final m = Map<String, dynamic>.from(l as Map);
-      final pCode = (m['pathway_code'] ?? '').toString();
-      final label = (m['match_label'] ?? 'Match').toString();
-      final p = byCode[pCode];
-      if (p != null) out.add(PathwayMatch(p, label));
+      final list = (rows as List?) ?? const [];
+      if (list.isNotEmpty) {
+        return list
+            .map(
+              (e) =>
+                  Track.fromRow(_coerceTrackRow(Map<String, dynamic>.from(e))),
+            )
+            .toList();
+      }
+    } catch (e) {
+      // ignore: avoid_print
+      print('listTracks strands(all) error: $e');
+    }
+
+    // 3) tracks table
+    try {
+      final rows = await supa
+          .from('tracks')
+          .select('*')
+          .order('track_name', ascending: true);
+
+      final list = (rows as List?) ?? const [];
+      if (list.isNotEmpty) {
+        return list
+            .map(
+              (e) =>
+                  Track.fromRow(_coerceTrackRow(Map<String, dynamic>.from(e))),
+            )
+            .toList();
+      }
+    } catch (e) {
+      // ignore: avoid_print
+      print('listTracks tracks error: $e');
+    }
+
+    // 4) views as last resort
+    for (final view in const ['v_strands_shs', 'v_tracks_shs']) {
+      try {
+        final rows = await supa.from(view).select('*');
+        final list = (rows as List?) ?? const [];
+        if (list.isNotEmpty) {
+          return list
+              .map(
+                (e) => Track.fromRow(
+                  _coerceTrackRow(Map<String, dynamic>.from(e)),
+                ),
+              )
+              .toList();
+        }
+      } catch (e) {
+        // ignore: avoid_print
+        print('listTracks $view error: $e');
+      }
+    }
+
+    return const [];
+  }
+
+  /// Courses filtered for a given track/strand code or UUID.
+  /// Returns only active (or rows without an `active` flag).
+  static Future<List<Map<String, dynamic>>> listCoursesForTrackCode(
+    String codeOrId,
+  ) async {
+    final normalized = _normalizeCode(codeOrId);
+
+    final sel = supa
+        .from('courses')
+        .select(
+          'course_id,name,summary,tags,sources,riasec_primary,track_id,track_code,strand_id,active',
+        )
+        .or(
+          'track_code.eq.$normalized,track_id.eq.$codeOrId,strand_id.eq.$codeOrId',
+        )
+        .order('name', ascending: true);
+
+    List<dynamic> rows;
+    try {
+      rows = await sel;
+    } catch (e) {
+      _d('listCoursesForTrackCode error: $e');
+      rows = const [];
+    }
+
+    final out = <Map<String, dynamic>>[];
+    for (final r in rows.cast<Map>()) {
+      final m = Map<String, dynamic>.from(r as Map);
+      final hasActive = m.containsKey('active');
+      if (!hasActive || m['active'] == true) out.add(m);
     }
     return out;
   }
-  // ==== END: Exploration fetchers ====
+  // ===== END: Tracks ===========================================================
 
   // ---------- QUESTIONNAIRE ----------
   static Future<void> saveQuestionnaireResponses(Map<int, int> answers) async {
@@ -617,7 +849,8 @@ class SupabaseService {
     String quizId, {
     String status = 'in_progress',
     int? score,
-    Map<int, int>? answers,
+    Map<int, int>? answers, // legacy single
+    Map<int, List<int>>? answersMulti, // NEW multi
   }) async {
     final uid = authUserId;
     if (uid == null) throw 'Not logged in';
@@ -632,6 +865,10 @@ class SupabaseService {
       'answers':
           answers != null
               ? answers.map((k, v) => MapEntry(k.toString(), v))
+              : null,
+      'answers_multi':
+          answersMulti != null
+              ? answersMulti.map((k, v) => MapEntry(k.toString(), v))
               : null,
       'updated_at': DateTime.now().toIso8601String(),
     }, onConflict: 'user_id,quiz_id');
@@ -916,20 +1153,20 @@ class SupabaseService {
       }
 
       if (decoded is Map<String, dynamic> && decoded['pools'] is Map) {
-        final pools = Map<String, dynamic>.from(decoded['pools']);
-
-        List<Map<String, dynamic>> _asList(String k) {
-          final v = pools[k];
-          if (v is List) {
-            return v.map((e) => Map<String, dynamic>.from(e as Map)).toList();
-          }
-          return <Map<String, dynamic>>[];
-        }
-
-        final easy = _asList('easy');
-        final medium = _asList('medium');
-        final hard = _asList('hard');
-
+        final pools = <String, List<Map<String, dynamic>>>{
+          'easy':
+              (((decoded['pools'] as Map)['easy'] as List?) ?? const [])
+                  .map((e) => Map<String, dynamic>.from(e as Map))
+                  .toList(),
+          'medium':
+              (((decoded['pools'] as Map)['medium'] as List?) ?? const [])
+                  .map((e) => Map<String, dynamic>.from(e as Map))
+                  .toList(),
+          'hard':
+              (((decoded['pools'] as Map)['hard'] as List?) ?? const [])
+                  .map((e) => Map<String, dynamic>.from(e as Map))
+                  .toList(),
+        };
         final sel =
             (decoded['selection'] is Map)
                 ? Map<String, dynamic>.from(decoded['selection'])
@@ -945,9 +1182,12 @@ class SupabaseService {
           counts['medium'] = (tos['medium'] ?? 0) as int;
           counts['hard'] = (tos['hard'] ?? 0) as int;
 
-          counts['easy'] = counts['easy']!.clamp(0, easy.length);
-          counts['medium'] = counts['medium']!.clamp(0, medium.length);
-          counts['hard'] = counts['hard']!.clamp(0, hard.length);
+          counts['easy'] = counts['easy']!.clamp(0, pools['easy']!.length);
+          counts['medium'] = counts['medium']!.clamp(
+            0,
+            pools['medium']!.length,
+          );
+          counts['hard'] = counts['hard']!.clamp(0, pools['hard']!.length);
 
           int sum = counts.values.fold(0, (a, b) => a + b);
           while (sum > total) {
@@ -959,9 +1199,9 @@ class SupabaseService {
             }
           }
           final room = {
-            'easy': easy.length - counts['easy']!,
-            'medium': medium.length - counts['medium']!,
-            'hard': hard.length - counts['hard']!,
+            'easy': pools['easy']!.length - counts['easy']!,
+            'medium': pools['medium']!.length - counts['medium']!,
+            'hard': pools['hard']!.length - counts['hard']!,
           };
           while (sum < total) {
             final next = (['easy', 'medium', 'hard']..sort(
@@ -972,8 +1212,11 @@ class SupabaseService {
             sum++;
           }
         } else {
-          final all = <Map<String, dynamic>>[...easy, ...medium, ...hard]
-            ..shuffle();
+          final all = <Map<String, dynamic>>[
+            ...pools['easy']!,
+            ...pools['medium']!,
+            ...pools['hard']!,
+          ]..shuffle();
           return all.take(total.clamp(0, all.length)).toList();
         }
 
@@ -984,17 +1227,23 @@ class SupabaseService {
         }
 
         var selected = <Map<String, dynamic>>[
-          ...pick(easy, counts['easy']!),
-          ...pick(medium, counts['medium']!),
-          ...pick(hard, counts['hard']!),
+          ...pick(pools['easy']!, counts['easy']!),
+          ...pick(pools['medium']!, counts['medium']!),
+          ...pick(pools['hard']!, counts['hard']!),
         ];
 
         if (selected.length < total) {
           final used = selected.map((q) => q['id'] ?? q['question']).toSet();
           final leftovers = <Map<String, dynamic>>[
-            ...easy.where((q) => !used.contains(q['id'] ?? q['question'])),
-            ...medium.where((q) => !used.contains(q['id'] ?? q['question'])),
-            ...hard.where((q) => !used.contains(q['id'] ?? q['question'])),
+            ...pools['easy']!.where(
+              (q) => !used.contains(q['id'] ?? q['question']),
+            ),
+            ...pools['medium']!.where(
+              (q) => !used.contains(q['id'] ?? q['question']),
+            ),
+            ...pools['hard']!.where(
+              (q) => !used.contains(q['id'] ?? q['question']),
+            ),
           ]..shuffle();
           selected.addAll(leftovers.take(total - selected.length));
         } else if (selected.length > total) {
@@ -1077,58 +1326,30 @@ class SupabaseService {
       try {
         return supa.storage.from(bucket).getPublicUrl(path);
       } catch (e) {
-        // ignore: avoid_print
-        print('getFileUrl failed for $bucket/$path: $e');
+        _d('getFileUrl failed for $bucket/$path: $e');
         return null;
       }
     }
   }
 
-  // ---- QUIZ: BANK + TOS LOADER ----
+  // ---- QUIZ: BANK + TOS LOADER (root-bucket + admin JSON aware) ----
   static Future<List<Map<String, dynamic>>> fetchQuizWithTOS({
     required String quizId,
     String bucket = 'quizzes',
     int? seed,
     int totalOverride = 10,
   }) async {
-    final bankBytes = await supa.storage.from(bucket).download('$quizId.json');
-    final dynamic bankDecoded = json.decode(utf8.decode(bankBytes));
-    final List<Map<String, dynamic>> bank =
-        bankDecoded is List
-            ? (bankDecoded as List)
-                .map((e) => Map<String, dynamic>.from(e as Map))
-                .toList()
-            : List<Map<String, dynamic>>.from((bankDecoded['questions'] ?? []));
-
-    if (bank.isEmpty) return [];
-
-    final int target = min(totalOverride, bank.length);
-
-    Map<String, dynamic>? specData;
-    try {
-      final tosBytes = await supa.storage
-          .from(bucket)
-          .download('${quizId}_tos.json');
-      specData = json.decode(utf8.decode(tosBytes)) as Map<String, dynamic>;
-    } catch (_) {
-      final rnd = seed == null ? Random() : Random(seed);
-      final copy = List<Map<String, dynamic>>.of(bank)..shuffle(rnd);
-      return copy.take(target).toList();
-    }
-
-    final Map<String, List<Map<String, dynamic>>> byDiff = {
-      'easy': [],
-      'medium': [],
-      'hard': [],
-    };
-    for (final q in bank) {
-      final d = (q['difficulty'] ?? '').toString().toLowerCase();
-      if (byDiff.containsKey(d)) byDiff[d]!.add(q);
-    }
+    // helpers
+    String _squash(String s) =>
+        s.toLowerCase().replaceAll(RegExp(r'[^a-z0-9]+'), '');
+    String _hyphenize(String s) => s
+        .toLowerCase()
+        .replaceAll(RegExp(r'[^a-z0-9]+'), '-')
+        .replaceAll(RegExp(r'-+'), '-');
 
     final rnd = seed == null ? Random() : Random(seed);
     List<T> pick<T>(List<T> list, int n) {
-      if (n <= 0 || list.isEmpty) return [];
+      if (n <= 0 || list.isEmpty) return <T>[]; // <-- not const
       final copy = List<T>.of(list);
       for (int i = copy.length - 1; i > 0; i--) {
         final j = rnd.nextInt(i + 1);
@@ -1140,161 +1361,311 @@ class SupabaseService {
       return copy.take(cnt).toList();
     }
 
-    final bool isWeighted =
-        (specData['mode']?.toString().toLowerCase() == 'weighted') ||
-        (specData.containsKey('weights'));
-
-    var counts = <String, int>{'easy': 0, 'medium': 0, 'hard': 0};
-
-    if (!isWeighted) {
-      counts['easy'] = (specData['easy'] ?? 0) as int;
-      counts['medium'] = (specData['medium'] ?? 0) as int;
-      counts['hard'] = (specData['hard'] ?? 0) as int;
-
+    Map<String, int> _safeCounts({
+      required Map<String, int> want,
+      required Map<String, List<Map<String, dynamic>>> pools,
+      required int total,
+    }) {
+      final counts = <String, int>{...want};
       for (final k in counts.keys) {
-        counts[k] = counts[k]!.clamp(0, byDiff[k]!.length);
+        counts[k] = counts[k]!.clamp(0, pools[k]!.length);
       }
-
       int sum = counts.values.fold(0, (a, b) => a + b);
-      while (sum > target) {
-        for (final k in ['hard', 'medium', 'easy']) {
-          if (counts[k]! > 0 && sum > target) {
+      while (sum > total) {
+        for (final k in const ['hard', 'medium', 'easy']) {
+          if (counts[k]! > 0 && sum > total) {
             counts[k] = counts[k]! - 1;
             sum--;
           }
         }
       }
-    } else {
-      final Map<String, dynamic> wRaw = Map<String, dynamic>.from(
-        specData['weights'] ?? {},
-      );
-      final Map<String, double> weights = {
-        'easy': (wRaw['easy'] ?? 1.0).toDouble(),
-        'medium': (wRaw['medium'] ?? 1.0).toDouble(),
-        'hard': (wRaw['hard'] ?? 1.0).toDouble(),
+      final room = {
+        'easy': pools['easy']!.length - counts['easy']!,
+        'medium': pools['medium']!.length - counts['medium']!,
+        'hard': pools['hard']!.length - counts['hard']!,
       };
+      while (sum < total) {
+        final next = (['easy', 'medium', 'hard']..sort(
+          (a, b) => room[b]!.compareTo(room[a]!),
+        )).firstWhere((k) => room[k]! > 0, orElse: () => 'easy');
+        counts[next] = counts[next]! + 1;
+        room[next] = room[next]! - 1;
+        sum++;
+      }
+      return counts;
+    }
 
-      final Map<String, dynamic> minRaw = Map<String, dynamic>.from(
-        specData['min'] ?? {},
-      );
-      final Map<String, dynamic> maxRaw = Map<String, dynamic>.from(
-        specData['max'] ?? {},
-      );
+    // 1) try direct filename guesses in ROOT
+    final norm = _normalizeId(quizId); // underscores
+    final hyph = _hyphenize(quizId); // hyphens
+    final normHyph = _hyphenize(norm);
 
-      final avail = <String, int>{
-        'easy': byDiff['easy']!.length,
-        'medium': byDiff['medium']!.length,
-        'hard': byDiff['hard']!.length,
-      };
+    final directCandidates =
+        <String>{
+          '$norm.json',
+          '$hyph.json',
+          '$normHyph.json',
+          'quiz_$norm.json',
+          'quiz-$norm.json',
+          'quiz_$hyph.json',
+          '${norm}_quiz.json',
+          // common admin filename patterns: "<title>-quiz_<id>.json"
+          '${hyph}_quiz.json',
+          '${hyph}-quiz.json',
+        }.toList();
 
-      var minC = <String, int>{
-        'easy':
-            (minRaw['easy'] ?? 0) is int
-                ? minRaw['easy'] as int
-                : int.tryParse('${minRaw['easy']}') ?? 0,
-        'medium':
-            (minRaw['medium'] ?? 0) is int
-                ? minRaw['medium'] as int
-                : int.tryParse('${minRaw['medium']}') ?? 0,
-        'hard':
-            (minRaw['hard'] ?? 0) is int
-                ? minRaw['hard'] as int
-                : int.tryParse('${minRaw['hard']}') ?? 0,
-      };
-      var maxC = <String, int>{
-        'easy':
-            (maxRaw['easy'] ?? target) is int
-                ? maxRaw['easy'] as int
-                : int.tryParse('${maxRaw['easy']}') ?? target,
-        'medium':
-            (maxRaw['medium'] ?? target) is int
-                ? maxRaw['medium'] as int
-                : int.tryParse('${maxRaw['medium']}') ?? target,
-        'hard':
-            (maxRaw['hard'] ?? target) is int
-                ? maxRaw['hard'] as int
-                : int.tryParse('${maxRaw['hard']}') ?? target,
-      };
+    String? foundPath;
+    Uint8List? payload;
 
-      for (final k in ['easy', 'medium', 'hard']) {
-        minC[k] = min(minC[k]!, avail[k]!);
-        maxC[k] = min(maxC[k]!, avail[k]!);
+    for (final p in directCandidates) {
+      try {
+        payload = await supa.storage.from(bucket).download(p);
+        foundPath = p;
+        // ignore: avoid_print
+        print('[storage] ✅ $bucket/$p');
+        break;
+      } catch (_) {
+        /* try next */
+      }
+    }
+
+    // 2) fuzzy search all jsons in root if not found
+    if (payload == null) {
+      final entries = await supa.storage.from(bucket).list(path: '');
+      final jsonFiles =
+          entries
+              .where((e) => e.name.toLowerCase().endsWith('.json'))
+              .map((e) => e.name)
+              .toList();
+
+      if (jsonFiles.isEmpty) throw 'No .json quizzes in bucket root.';
+
+      final goal = _squash(quizId);
+      String best = '';
+      int bestScore = -1;
+
+      for (final f in jsonFiles) {
+        final s = _squash(f.replaceAll('.json', ''));
+        // simple overlap score: length of longest common substring-ish window
+        int score = 0;
+        final n = min(s.length, goal.length);
+        for (int k = 1; k <= n; k++) {
+          if (goal.contains(s.substring(0, k))) score = k;
+        }
+        // also reward presence of "quiz_" id tail if any
+        if (s.contains('quiz') && goal.contains('quiz')) score += 3;
+        if (score > bestScore) {
+          bestScore = score;
+          best = f;
+        }
       }
 
-      int sumMin = minC.values.fold(0, (a, b) => a + b);
-      while (sumMin > target) {
-        for (final k in ['hard', 'medium', 'easy']) {
-          if (minC[k]! > 0) {
-            minC[k] = minC[k]! - 1;
-            sumMin--;
-            break;
+      try {
+        payload = await supa.storage.from(bucket).download(best);
+        foundPath = best;
+        // ignore: avoid_print
+        print('[storage] 🔎 fuzzy matched $bucket/$best for "$quizId"');
+      } catch (e) {
+        final diag =
+            StringBuffer()
+              ..writeln('Storage 404. File not found for "$quizId".')
+              ..writeln('Tried direct: $directCandidates')
+              ..writeln(
+                '[Bucket "$bucket" @ "/"] → ${jsonFiles.take(20).toList()}',
+              );
+        throw diag.toString();
+      }
+    }
+
+    final decoded = json.decode(utf8.decode(payload!));
+
+    // If the file is a raw bank (List) → handle TOS sidecar (optional) + return
+    if (decoded is List) {
+      final bank =
+          decoded.map((e) => Map<String, dynamic>.from(e as Map)).toList();
+      if (bank.isEmpty) return const [];
+      final target = min(totalOverride, bank.length);
+      final copy = List<Map<String, dynamic>>.of(bank)..shuffle(rnd);
+      return copy.take(target).toList();
+    }
+
+    if (decoded is! Map) return const [];
+    final root = Map<String, dynamic>.from(decoded);
+
+    // If it’s an admin quiz wrapper with title/metadata
+    List<Map<String, dynamic>> _mapAdminQuestions(List rawQs) {
+      final out = <Map<String, dynamic>>[];
+      for (final q0 in rawQs) {
+        final q = Map<String, dynamic>.from(q0 as Map);
+
+        final String type =
+            (q['question_type'] ?? 'choice').toString().toLowerCase();
+
+        // We only support choice / multi-choice in the current UI.
+        if (type != 'choice') {
+          // skip "text" for now
+          continue;
+        }
+
+        final List<String> options =
+            ((q['choices'] as List?) ?? const [])
+                .map((e) => e.toString())
+                .toList();
+
+        // admin JSON uses 0-based indexes in correct_answers
+        final List<int> idxs =
+            ((q['correct_answers'] as List?) ?? const [])
+                .whereType<num>()
+                .map((n) => n.toInt())
+                .toList();
+
+        final m = <String, dynamic>{
+          'text': (q['question_text'] ?? '').toString(),
+          'options': options,
+          'difficulty': (q['difficulty'] ?? '').toString(),
+          'allow_multiple': q['allow_multiple'] == true,
+          if ((q['allow_multiple'] == true) && idxs.isNotEmpty)
+            'correct_answers': idxs,
+          if (!(q['allow_multiple'] == true) && idxs.isNotEmpty)
+            // legacy single-answer compatibility
+            'answer_index': idxs.first,
+        };
+
+        // only add well-formed choice questions
+        if ((m['text'] as String).trim().isNotEmpty && options.isNotEmpty) {
+          out.add(m);
+        }
+      }
+      return out;
+    }
+
+    // case A: admin wrapper with questions[]
+    if (root['questions'] is List) {
+      final bank = _mapAdminQuestions(root['questions'] as List);
+      if (bank.isEmpty) return const [];
+
+      // optional embedded TOS/pools, else simple shuffle → trim
+      if (root['pools'] is Map) {
+        final poolsRaw = Map<String, dynamic>.from(root['pools']);
+        final pools = <String, List<Map<String, dynamic>>>{
+          'easy': _mapAdminQuestions(((poolsRaw['easy'] as List?) ?? const [])),
+          'medium': _mapAdminQuestions(
+            ((poolsRaw['medium'] as List?) ?? const []),
+          ),
+          'hard': _mapAdminQuestions(((poolsRaw['hard'] as List?) ?? const [])),
+        };
+        final sel =
+            (root['selection'] is Map)
+                ? Map<String, dynamic>.from(root['selection'])
+                : <String, dynamic>{};
+        final int total =
+            (sel['count'] is num)
+                ? (sel['count'] as num).toInt()
+                : totalOverride;
+
+        if (root['tos'] is Map) {
+          final tos = Map<String, dynamic>.from(root['tos']);
+          final want = <String, int>{
+            'easy': (tos['easy'] ?? 0) as int,
+            'medium': (tos['medium'] ?? 0) as int,
+            'hard': (tos['hard'] ?? 0) as int,
+          };
+          final counts = _safeCounts(want: want, pools: pools, total: total);
+          var selected = <Map<String, dynamic>>[
+            ...pick(pools['easy']!, counts['easy']!),
+            ...pick(pools['medium']!, counts['medium']!),
+            ...pick(pools['hard']!, counts['hard']!),
+          ];
+
+          if (selected.length < total) {
+            final used = selected.map((q) => q['text']).toSet();
+            final leftovers = <Map<String, dynamic>>[
+              ...pools['easy']!.where((q) => !used.contains(q['text'])),
+              ...pools['medium']!.where((q) => !used.contains(q['text'])),
+              ...pools['hard']!.where((q) => !used.contains(q['text'])),
+              ...bank.where((q) => !used.contains(q['text'])),
+            ]..shuffle(rnd);
+            selected.addAll(leftovers.take(total - selected.length));
+          } else if (selected.length > total) {
+            selected.shuffle(rnd);
+            selected = selected.take(total).toList();
           }
+          selected.shuffle(rnd);
+          return selected;
         }
+
+        final all = <Map<String, dynamic>>[
+          ...pools['easy']!,
+          ...pools['medium']!,
+          ...pools['hard']!,
+        ]..shuffle(rnd);
+        return all.take(min(total, all.length)).toList();
       }
 
-      counts = {
-        'easy': minC['easy']!,
-        'medium': minC['medium']!,
-        'hard': minC['hard']!,
-      };
-      int remaining = target - counts.values.fold(0, (a, b) => a + b);
-
-      double sumWeightsFor(Iterable<String> ks) {
-        double s = 0;
-        for (final k in ks) {
-          final v = weights[k] ?? 0;
-          if (v > 0) s += v;
-        }
-        return s > 0 ? s : ks.length.toDouble();
-      }
-
-      String drawWeighted(List<String> candidates) {
-        final positive =
-            candidates.where((k) => (weights[k] ?? 0) > 0).toList();
-        final pool = positive.isNotEmpty ? positive : candidates;
-        final totalW = sumWeightsFor(pool);
-        double r = rnd.nextDouble() * totalW;
-        for (final k in pool) {
-          final w =
-              (weights[k] ?? 0) > 0 ? (weights[k]!) : (totalW / pool.length);
-          if (r < w) return k;
-          r -= w;
-        }
-        return pool.last;
-      }
-
-      while (remaining > 0) {
-        final cands =
-            [
-              'easy',
-              'medium',
-              'hard',
-            ].where((k) => counts[k]! < maxC[k]!).toList();
-        if (cands.isEmpty) break;
-        final pickK = drawWeighted(cands);
-        counts[pickK] = counts[pickK]! + 1;
-        remaining--;
-      }
+      final target = min(totalOverride, bank.length);
+      final copy = List<Map<String, dynamic>>.of(bank)..shuffle(rnd);
+      return copy.take(target).toList();
     }
 
-    var selected = <Map<String, dynamic>>[
-      ...pick(byDiff['easy']!, counts['easy']!),
-      ...pick(byDiff['medium']!, counts['medium']!),
-      ...pick(byDiff['hard']!, counts['hard']!),
-    ];
+    // case B: legacy pools-only file (no wrapper list)
+    if (root['pools'] is Map) {
+      final poolsRaw = Map<String, dynamic>.from(root['pools']);
+      List<Map<String, dynamic>> _asList(dynamic v) =>
+          (v is List)
+              ? v.map((e) => Map<String, dynamic>.from(e)).toList()
+              : <Map<String, dynamic>>[];
 
-    if (selected.length < target) {
-      final used = selected.map((q) => q['id'] ?? q['text']).toSet();
-      final leftover =
-          bank.where((q) => !used.contains(q['id'] ?? q['text'])).toList();
-      selected.addAll(pick(leftover, target - selected.length));
-    } else if (selected.length > target) {
-      selected.shuffle(rnd);
-      selected = selected.take(target).toList();
+      final easy = _asList(poolsRaw['easy']);
+      final medium = _asList(poolsRaw['medium']);
+      final hard = _asList(poolsRaw['hard']);
+
+      final sel =
+          (root['selection'] is Map)
+              ? Map<String, dynamic>.from(root['selection'])
+              : <String, dynamic>{};
+      final int total =
+          (sel['count'] is num) ? (sel['count'] as num).toInt() : totalOverride;
+
+      if (root['tos'] is Map) {
+        final tos = Map<String, dynamic>.from(root['tos']);
+        final counts = _safeCounts(
+          want: {
+            'easy': (tos['easy'] ?? 0) as int,
+            'medium': (tos['medium'] ?? 0) as int,
+            'hard': (tos['hard'] ?? 0) as int,
+          },
+          pools: {'easy': easy, 'medium': medium, 'hard': hard},
+          total: total,
+        );
+
+        var selected = <Map<String, dynamic>>[
+          ...pick(easy, counts['easy']!),
+          ...pick(medium, counts['medium']!),
+          ...pick(hard, counts['hard']!),
+        ];
+
+        if (selected.length < total) {
+          final used = selected.map((q) => q['id'] ?? q['text']).toSet();
+          final leftovers = <Map<String, dynamic>>[
+            ...easy.where((q) => !used.contains(q['id'] ?? q['text'])),
+            ...medium.where((q) => !used.contains(q['id'] ?? q['text'])),
+            ...hard.where((q) => !used.contains(q['id'] ?? q['text'])),
+          ]..shuffle(rnd);
+          selected.addAll(leftovers.take(total - selected.length));
+        } else if (selected.length > total) {
+          selected.shuffle(rnd);
+          selected = selected.take(total).toList();
+        }
+        selected.shuffle(rnd);
+        return selected;
+      }
+
+      final all = <Map<String, dynamic>>[...easy, ...medium, ...hard]
+        ..shuffle(rnd);
+      return all.take(min(total, all.length)).toList();
     }
 
-    selected.shuffle(rnd);
-    return selected;
+    return const [];
   }
 
   // ---------- HELPERS ----------
@@ -1432,7 +1803,7 @@ class SupabaseService {
     final res = await supa.rpc('recommend_courses', params: {'p_user': uid});
     if (res is List) {
       return res
-          .whereType<Map>() // guard against odd payloads
+          .whereType<Map>()
           .map((e) => Map<String, dynamic>.from(e as Map))
           .toList();
     }
@@ -1451,16 +1822,15 @@ class SupabaseService {
     return list.isEmpty ? null : list.first;
   }
 
-  // Use the paramless API wrapper you created: api.compute_learning_path
   static Future<Map<String, dynamic>?> previewLearningPath() async {
     final res = await supa.rpc('compute_learning_path_preview'); // no params
     if (res is Map) return Map<String, dynamic>.from(res);
-    if (res is List && res.isNotEmpty)
+    if (res is List && res.isNotEmpty) {
       return Map<String, dynamic>.from(res.first);
+    }
     return null;
   }
 
-  // Must pass the uid to the uuid-version function
   static Future<void> finalizeLearningPath() async {
     final uid = authUserId ?? (throw Exception('Not logged in'));
     await supa.rpc('finalize_learning_path', params: {'p_user': uid});
@@ -1504,7 +1874,6 @@ class SupabaseService {
 
     Map<String, dynamic>? preview;
     if (hasRiasec && hasNcae) {
-      // use new recommender preview
       preview = await previewRecommendation();
     }
 
@@ -1615,7 +1984,7 @@ class SupabaseService {
             .eq('user_id', userId)
             .order('taken_at', ascending: false)
             .limit(1)
-            .maybeSingle(); // -> Map<String, dynamic>? or null
+            .maybeSingle();
     return row != null;
   }
 
@@ -1672,4 +2041,291 @@ class SupabaseService {
       'max_attempts': maxAttempts,
     });
   }
+
+  // ======= Exploration helpers (user strand & strands listing) =================
+
+  static Future<String?> getUserStrandOrCourseCode() async {
+    final uid = authUserId;
+    if (uid == null) return null;
+
+    // Prefer explicit track fields (since your UI stores TECHPRO), then strand, then course.
+    final probes = <List<String>>[
+      ['track_code'],
+      ['track_id'], // might be a UUID → resolve below
+      ['strand_code', 'course_code'],
+      ['strand_id', 'course_id'],
+      ['strand', 'course'],
+      ['shs_strand_code', 'course_code'],
+      ['shs_strand', 'course_code'],
+    ];
+
+    for (final cols in probes) {
+      try {
+        final row =
+            await supa
+                .from('users')
+                .select(cols.join(','))
+                .eq('supabase_id', uid)
+                .maybeSingle();
+        if (row == null) continue;
+
+        for (final c in cols) {
+          final v = row[c];
+          if (v == null) continue;
+
+          if (c == 'track_id') {
+            final resolved = await _resolveTrackCode(v);
+            if (resolved != null && resolved.isNotEmpty) return resolved;
+          }
+
+          if (v is String && v.trim().isNotEmpty) return v.trim();
+        }
+      } catch (_) {
+        /* keep probing */
+      }
+    }
+    return null;
+  }
+
+  static Future<List<Strand>> listStrands({
+    List<String> codes = const ['ACADEMIC', 'TECHPRO'],
+  }) async {
+    // Prefer the base table
+    try {
+      final q = supa.from('strands').select('*');
+      final rows =
+          codes.isEmpty
+              ? await q
+              : (codes.length == 1
+                  ? await q.eq('code', codes.first)
+                  : await _eqOrIn(q, 'code', codes));
+      final list = (rows as List?) ?? const [];
+      if (list.isNotEmpty) {
+        return list
+            .map((e) => Strand.fromRow(Map<String, dynamic>.from(e)))
+            .toList();
+      }
+    } catch (_) {}
+
+    // Fallback to view if present (maps to column strand_id)
+    try {
+      final q = supa.from('v_strands_shs').select('*');
+      final rows =
+          codes.isEmpty
+              ? await q
+              : (codes.length == 1
+                  ? await q.eq('strand_id', codes.first)
+                  : await _eqOrIn(q, 'strand_id', codes));
+      final list = (rows as List?) ?? const [];
+      return list
+          .map((e) => Strand.fromRow(Map<String, dynamic>.from(e)))
+          .toList();
+    } catch (_) {
+      return const [];
+    }
+  }
+
+  static Future<Strand?> getStrandByCode(String code) async {
+    // Table first
+    try {
+      final tblRow =
+          await supa.from('strands').select('*').eq('code', code).maybeSingle();
+      if (tblRow != null) {
+        return Strand.fromRow(Map<String, dynamic>.from(tblRow));
+      }
+    } catch (_) {}
+
+    // Then view
+    try {
+      final viewRow =
+          await supa
+              .from('v_strands_shs')
+              .select('*')
+              .eq('strand_id', code)
+              .maybeSingle();
+      if (viewRow != null) {
+        return Strand.fromRow(Map<String, dynamic>.from(viewRow));
+      }
+    } catch (_) {}
+    return null;
+  }
+
+  static Future<List<Map<String, dynamic>>> listCoursesForStrandCode(
+    String strandCode,
+  ) async {
+    final rows = await supa
+        .from('courses')
+        .select(
+          'course_id,name,summary,tags,sources,riasec_primary,strand_id,active',
+        )
+        .eq('strand_id', strandCode)
+        .eq('active', true)
+        .order('name');
+    return (rows as List?)?.cast<Map<String, dynamic>>() ?? const [];
+  }
+
+  // ---- Normalizers -----------------------------------------------------------
+
+  static List<String> _toStringList(dynamic v) {
+    if (v == null) return const [];
+    if (v is List) return v.map((e) => '$e').toList();
+    if (v is String) {
+      // try to parse JSON text like '["a","b"]'
+      try {
+        final j = jsonDecode(v);
+        if (j is List) return j.map((e) => '$e').toList();
+      } catch (_) {}
+      return v.isEmpty ? const [] : <String>[v];
+    }
+    return const [];
+  }
+
+  static List<SourceLink> _toSources(dynamic v) {
+    if (v == null) return const [];
+    List list;
+    if (v is List) {
+      list = v;
+    } else if (v is String) {
+      try {
+        final j = jsonDecode(v);
+        if (j is List) {
+          list = j;
+        } else if (j is Map) {
+          list = [j];
+        } else {
+          return const [];
+        }
+      } catch (_) {
+        return const [];
+      }
+    } else {
+      return const [];
+    }
+
+    return list
+        .map((e) {
+          if (e is Map) {
+            return SourceLink.fromJson(Map<String, dynamic>.from(e));
+          }
+          if (e is String) {
+            try {
+              final m = jsonDecode(e);
+              if (m is Map) {
+                return SourceLink.fromJson(Map<String, dynamic>.from(m));
+              }
+            } catch (_) {}
+          }
+          return const SourceLink(name: '', url: '');
+        })
+        .where((s) => s.name.isNotEmpty || s.url.isNotEmpty)
+        .toList();
+  }
+
+  // Safely extract a list of rows from an RPC response across SDK versions.
+  static List<Map<String, dynamic>> _rowsFromRpc(dynamic res) {
+    dynamic raw;
+    if (res is List) {
+      raw = res;
+    } else if (res is Map && res['data'] is List) {
+      raw = res['data'];
+    } else {
+      raw = const [];
+    }
+    return (raw as List)
+        .whereType<dynamic>()
+        .map((e) => Map<String, dynamic>.from(e as Map))
+        .toList();
+  }
+}
+
+// ===================== TOP-LEVEL HELPERS FOR TRACK COERCION =====================
+
+// Build an OR expression like: code.eq.A,code.eq.B
+String _orEq(String column, List<String> values) {
+  return values.map((v) => "$column.eq.$v").join(",");
+}
+
+// Portable helper: use eq for 1 value, else filter('in', '("a","b")')
+Future<List<dynamic>> _eqOrIn(
+  PostgrestFilterBuilder<dynamic> q,
+  String column,
+  List<String> values,
+) async {
+  if (values.isEmpty) return await q;
+  if (values.length == 1) return await q.eq(column, values.first);
+  final inList = '(${values.map((v) => '"$v"').join(",")})';
+  return await q.filter(column, 'in', inList);
+}
+
+// Coerce dynamic → List<String>
+List<String> _asStringList(dynamic v) {
+  if (v == null) return const [];
+  if (v is List) return v.map((e) => e.toString()).toList();
+  if (v is String && v.trim().isNotEmpty) {
+    try {
+      final d = json.decode(v);
+      if (d is List) return d.map((e) => e.toString()).toList();
+    } catch (_) {}
+  }
+  return const [];
+}
+
+// Coerce dynamic → List<SourceLink>
+List<SourceLink> _asSources(dynamic v) {
+  if (v == null) return const [];
+  final out = <SourceLink>[];
+  if (v is List) {
+    for (final e in v) {
+      if (e is Map) out.add(SourceLink.fromJson(Map<String, dynamic>.from(e)));
+    }
+    return out;
+  }
+  if (v is String && v.trim().isNotEmpty) {
+    try {
+      final d = json.decode(v);
+      if (d is List) {
+        for (final e in d) {
+          if (e is Map) {
+            out.add(SourceLink.fromJson(Map<String, dynamic>.from(e)));
+          }
+        }
+        return out;
+      }
+    } catch (_) {}
+  }
+  return const [];
+}
+
+/// Normalize various table/view row shapes into what `Track.fromRow` expects.
+Map<String, dynamic> _coerceTrackRow(Map<String, dynamic> r) {
+  String pickStr(List<String> keys, {String def = ''}) {
+    for (final k in keys) {
+      final v = r[k];
+      if (v != null && v.toString().trim().isNotEmpty) return v.toString();
+    }
+    return def;
+  }
+
+  List<String> _asStrList(dynamic v) =>
+      (v is List) ? v.map((e) => e.toString()).toList() : const <String>[];
+
+  // different name to avoid shadowing the global helper
+  List<Map<String, dynamic>> _asSourcesMapList(dynamic v) =>
+      (v is List)
+          ? v.map((e) => Map<String, dynamic>.from(e as Map)).toList()
+          : const <Map<String, dynamic>>[];
+
+  return <String, dynamic>{
+    'code': pickStr(['code', 'track_code', 'track_id', 'strand_id']),
+    'name': pickStr(['name', 'track_name', 'title']),
+    'summary': pickStr(['summary', 'description']),
+    'badge_color': pickStr(['badge_color'], def: '#1976D2'),
+    'gradient_start': pickStr(['gradient_start'], def: '#B3E5FC'),
+    'gradient_end': pickStr(['gradient_end'], def: '#81D4FA'),
+    'points': _asStrList(r['points']),
+    'sample_curriculum': _asStrList(r['sample_curriculum']),
+    'entry_roles': _asStrList(r['entry_roles']),
+    'skills': _asStrList(r['skills']),
+    'sources': _asSourcesMapList(r['sources']),
+  };
 }

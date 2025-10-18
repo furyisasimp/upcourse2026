@@ -7,6 +7,7 @@ import 'quiz_categories_screen.dart';
 import 'profile_details_screen.dart';
 import '../widgets/custom_taskbar.dart';
 import '../services/supabase_service.dart';
+import '../models/exploration_models.dart'; // Track / Pathway / SourceLink
 
 // ===== THEME =====
 const kPrimaryBlue = Color(0xFF3EB6FF);
@@ -29,7 +30,7 @@ class ExplorationScreen extends StatefulWidget {
 }
 
 class _ExplorationScreenState extends State<ExplorationScreen> {
-  final Map<String, GlobalKey> _strandKeys = {}; // built after fetch
+  final Map<String, GlobalKey> _trackKeys = {}; // built after fetch
   final _scrollController = ScrollController();
 
   // Small recommender (kept)
@@ -58,20 +59,21 @@ class _ExplorationScreenState extends State<ExplorationScreen> {
   }
 
   Future<_VM> _load() async {
-    final userCode = await SupabaseService.getUserStrandOrCourseCode();
+    // Pull the user's track code (e.g., TECHPRO / ACADEMIC / STEM)
+    final userCode = await SupabaseService.getUserTrackCode();
 
-    Strand? userStrand; // <-- declare nullable
+    Track? userTrack;
     if (userCode != null && userCode.isNotEmpty) {
-      userStrand = await SupabaseService.getStrandByCode(userCode);
+      userTrack = await SupabaseService.getTrackByCode(userCode);
     }
 
-    final strands = await SupabaseService.listStrands();
+    final tracks = await SupabaseService.listTracks();
 
-    _strandKeys
+    _trackKeys
       ..clear()
-      ..addEntries(strands.map((s) => MapEntry(s.code, GlobalKey())));
+      ..addEntries(tracks.map((t) => MapEntry(t.code, GlobalKey())));
 
-    return _VM(userStrand: userStrand, strands: strands);
+    return _VM(userTrack: userTrack, tracks: tracks);
   }
 
   // Open URLs safely
@@ -93,7 +95,7 @@ class _ExplorationScreenState extends State<ExplorationScreen> {
         preferredSize: Size.fromHeight(110),
         child: _CurvedHeader(
           title: 'Exploration',
-          subtitle: 'Discover SHS strands & college pathways',
+          subtitle: 'Discover Tracks & College Pathways',
           trailingIcon: Icons.explore_rounded,
         ),
       ),
@@ -109,13 +111,13 @@ class _ExplorationScreenState extends State<ExplorationScreen> {
             }
 
             final vm = snap.data!;
-            final userStrand = vm.userStrand;
-            final strands = vm.strands;
+            final userTrack = vm.userTrack;
+            final tracks = vm.tracks;
 
-            final ordered = <Strand>[
-              if (userStrand != null) userStrand,
-              ...strands.where(
-                (s) => userStrand == null || s.code != userStrand.code,
+            final ordered = <Track>[
+              if (userTrack != null) userTrack,
+              ...tracks.where(
+                (t) => userTrack == null || t.code != userTrack.code,
               ),
             ];
 
@@ -126,44 +128,43 @@ class _ExplorationScreenState extends State<ExplorationScreen> {
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
                   _sectionTitle(
-                    userStrand != null
+                    userTrack != null
                         ? 'Recommended for You'
-                        : 'Recommended SHS Strands',
-                    userStrand != null
-                        ? 'Based on your profile: ${userStrand.name}'
+                        : 'Recommended Tracks',
+                    userTrack != null
+                        ? 'Based on your profile: ${userTrack.name}'
                         : 'Based on your interests',
                   ),
 
-                  // Dynamic cards (STEM, ABM, GAS, TECHPRO, …)
+                  // Dynamic cards (e.g., Academic, TVL-ICT, TVL-HE, Arts & Design, Sports)
                   ...ordered.map(
-                    (s) => Padding(
+                    (t) => Padding(
                       padding: const EdgeInsets.only(bottom: 12),
-                      child: _shsStrandCard(
-                        key: _strandKeys[s.code],
-                        title: s.name,
+                      child: _shsTrackCard(
+                        key: _trackKeys[t.code],
+                        title: t.name,
                         match:
-                            (userStrand != null && s.code == userStrand.code)
-                                ? 'Your strand'
+                            (userTrack != null && t.code == userTrack.code)
+                                ? 'Your track'
                                 : 'Explore',
-                        description: s.summary,
-                        points: s.points,
+                        description: t.summary,
+                        points: t.points,
                         gradient: LinearGradient(
-                          colors: [_hex(s.gradientStart), _hex(s.gradientEnd)],
+                          colors: [_hex(t.gradientStart), _hex(t.gradientEnd)],
                         ),
-                        badgeColor: _hex(s.badgeColor),
-                        icon: _iconForStrand(s.code),
+                        badgeColor: _hex(t.badgeColor),
+                        icon: _iconForTrack(t.code),
                         onTap:
-                            () => _showStrandSheet(
+                            () => _showTrackSheet(
                               context,
-                              strandCode:
-                                  s.code, // pass code so we can fetch courses
-                              strand: s.name,
-                              summary: s.summary,
-                              sampleCurriculum: s.sampleCurriculum,
-                              entryRoles: s.entryRoles,
-                              skills: s.skills,
+                              trackCode: t.code, // code to fetch pathways
+                              track: t.name,
+                              summary: t.summary,
+                              sampleCurriculum: t.sampleCurriculum,
+                              entryRoles: t.entryRoles,
+                              skills: t.skills,
                               sources:
-                                  s.sources
+                                  t.sources
                                       .map((x) => _Source(x.name, x.url))
                                       .toList(),
                             ),
@@ -173,17 +174,17 @@ class _ExplorationScreenState extends State<ExplorationScreen> {
 
                   const SizedBox(height: 20),
 
-                  // College Pathways (inline) – show for user's strand if available
+                  // College Pathways (inline) – show for user's track if available
                   _sectionTitle(
                     'College Pathways',
-                    userStrand != null
-                        ? 'For ${userStrand.name}'
-                        : 'Tap a strand to view',
+                    userTrack != null
+                        ? 'For ${userTrack.name}'
+                        : 'Tap a track to view',
                   ),
-                  if (userStrand != null)
-                    FutureBuilder<List<Map<String, dynamic>>>(
-                      future: SupabaseService.listCoursesForStrandCode(
-                        userStrand.code,
+                  if (userTrack != null)
+                    FutureBuilder<List<PathwayMatch>>(
+                      future: SupabaseService.listPathwaysForStrand(
+                        userTrack.code,
                       ),
                       builder: (context, s) {
                         if (s.connectionState != ConnectionState.done) {
@@ -199,7 +200,7 @@ class _ExplorationScreenState extends State<ExplorationScreen> {
                             child: Padding(
                               padding: const EdgeInsets.all(12),
                               child: Text(
-                                'Failed to load courses: ${s.error}',
+                                'Failed to load pathways: ${s.error}',
                                 style: const TextStyle(fontFamily: 'Inter'),
                               ),
                             ),
@@ -211,7 +212,7 @@ class _ExplorationScreenState extends State<ExplorationScreen> {
                             child: const Padding(
                               padding: EdgeInsets.all(12),
                               child: Text(
-                                'No courses found yet for this strand.',
+                                'No pathways found yet for this track.',
                                 style: TextStyle(fontFamily: 'Inter'),
                               ),
                             ),
@@ -219,7 +220,7 @@ class _ExplorationScreenState extends State<ExplorationScreen> {
                         }
                         return _coursesContainer(
                           child: Column(
-                            children: rows.map((r) => _courseTile(r)).toList(),
+                            children: rows.map(_pathwayTile).toList(),
                           ),
                         );
                       },
@@ -229,8 +230,8 @@ class _ExplorationScreenState extends State<ExplorationScreen> {
                       child: const Padding(
                         padding: EdgeInsets.all(12),
                         child: Text(
-                          "Pathways appear after you choose or are matched to a strand. "
-                          "Tap any strand card above to see its pathways.",
+                          "Pathways appear after you choose or are matched to a track. "
+                          "Tap any track card above to see its pathways.",
                           style: TextStyle(fontFamily: 'Inter'),
                         ),
                       ),
@@ -253,7 +254,7 @@ class _ExplorationScreenState extends State<ExplorationScreen> {
                   const SizedBox(height: 20),
                   _sectionTitle(
                     'AI Career Counselor (Lite)',
-                    'Pick interests to get strand suggestions',
+                    'Pick interests to get track suggestions',
                   ),
                   _aiCounselorCard(
                     interests: _interests,
@@ -306,45 +307,52 @@ class _ExplorationScreenState extends State<ExplorationScreen> {
     );
   }
 
-  // Icons per strand
-  IconData _iconForStrand(String code) {
+  // Icons per track (adjust to your codes)
+  IconData _iconForTrack(String code) {
     switch (code.toUpperCase()) {
-      case 'STEM':
-        return Icons.science_rounded;
-      case 'ABM':
-        return Icons.monetization_on_rounded;
-      case 'GAS':
-        return Icons.lightbulb_rounded;
+      case 'ACAD':
+      case 'ACADTRACK':
+        return Icons.menu_book_rounded; // Academic
+      case 'TVL-ICT':
       case 'TECHPRO':
-        return Icons.build_rounded;
+      case 'TVL':
+        return Icons.memory_rounded; // TVL/ICT
+      case 'TVL-HE':
+        return Icons.restaurant_rounded; // Home Economics
+      case 'ARTS':
+      case 'ARTS&DESIGN':
+      case 'ARTS-DESIGN':
+        return Icons.brush_rounded; // Arts & Design
+      case 'SPORTS':
+        return Icons.sports_soccer_rounded; // Sports
       default:
         return Icons.school_rounded;
     }
   }
 
-  // --- Simple heuristic recommender (kept)
+  // --- Simple heuristic recommender (now returns track codes)
   List<String> _recommend(Set<String> picks) {
-    int ictScore = 0, stemScore = 0;
+    int acadScore = 0, tvlIctScore = 0;
     for (final p in picks) {
       switch (p) {
         case 'Programming':
         case 'Design/UX':
         case 'Analytics':
-          ictScore += 2;
+          tvlIctScore += 2;
           break;
         case 'Math/Logic':
         case 'Science':
         case 'Robotics':
-          stemScore += 2;
+          acadScore += 2;
           break;
       }
     }
-    if (ictScore == stemScore) return ['TECHPRO', 'GAS']; // neutral nudge
-    return (ictScore > stemScore) ? ['TECHPRO'] : ['STEM'];
+    if (acadScore == tvlIctScore) return ['ACAD', 'TVL-ICT']; // neutral nudge
+    return (tvlIctScore > acadScore) ? ['TVL-ICT'] : ['ACAD'];
   }
 
-  void _scrollToStrand(String strand) {
-    final key = _strandKeys[strand];
+  void _scrollToTrack(String code) {
+    final key = _trackKeys[code];
     if (key?.currentContext == null) return;
     Scrollable.ensureVisible(
       key!.currentContext!,
@@ -354,7 +362,7 @@ class _ExplorationScreenState extends State<ExplorationScreen> {
     );
   }
 
-  // ====== COURSES (college pathways) UI helpers ======
+  // ====== PATHWAYS UI ======
   static Widget _coursesContainer({required Widget child}) {
     return Container(
       width: double.infinity,
@@ -392,11 +400,10 @@ class _ExplorationScreenState extends State<ExplorationScreen> {
     );
   }
 
-  static Widget _courseTile(Map<String, dynamic> r) {
-    final name = (r['name'] ?? '').toString();
-    final summary = (r['summary'] ?? '').toString();
-    final riasec = (r['riasec_primary'] ?? '').toString();
-
+  // New compact renderer for Pathway + label
+  static Widget _pathwayTile(PathwayMatch pm) {
+    final p = pm.pathway;
+    final hasOutcomes = p.outcomes.isNotEmpty;
     return Container(
       margin: const EdgeInsets.symmetric(vertical: 6),
       padding: const EdgeInsets.all(12),
@@ -405,43 +412,64 @@ class _ExplorationScreenState extends State<ExplorationScreen> {
         borderRadius: BorderRadius.circular(10),
         border: Border.all(color: Colors.grey.shade200),
       ),
-      child: Row(
+      child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          const Icon(Icons.menu_book_rounded, color: kPrimaryBlue),
-          const SizedBox(width: 10),
-          Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Row(
-                  children: [
-                    Expanded(
-                      child: Text(
-                        name,
-                        style: const TextStyle(
-                          fontFamily: 'Poppins',
-                          fontWeight: FontWeight.w700,
-                        ),
-                      ),
-                    ),
-                    _riasecBadge(riasec),
-                  ],
+          Row(
+            children: [
+              const Icon(Icons.menu_book_rounded, color: kPrimaryBlue),
+              const SizedBox(width: 10),
+              Expanded(
+                child: Text(
+                  p.name,
+                  style: const TextStyle(
+                    fontFamily: 'Poppins',
+                    fontWeight: FontWeight.w700,
+                  ),
                 ),
-                if (summary.isNotEmpty) ...[
-                  const SizedBox(height: 4),
-                  Text(
-                    summary,
+              ),
+              if (pm.matchLabel.isNotEmpty)
+                Container(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 8,
+                    vertical: 4,
+                  ),
+                  decoration: BoxDecoration(
+                    color: const Color(0xFFEFF6FF),
+                    borderRadius: BorderRadius.circular(8),
+                    border: Border.all(color: Colors.blue.shade100),
+                  ),
+                  child: Text(
+                    pm.matchLabel,
                     style: const TextStyle(
                       fontFamily: 'Inter',
-                      color: kTextSecondary,
-                      fontSize: 13,
+                      fontWeight: FontWeight.w700,
+                      color: Color(0xFF2563EB),
+                      fontSize: 12,
                     ),
                   ),
-                ],
-              ],
-            ),
+                ),
+            ],
           ),
+          if (p.subtitle.isNotEmpty) ...[
+            const SizedBox(height: 6),
+            Text(
+              p.subtitle,
+              style: const TextStyle(
+                fontFamily: 'Inter',
+                color: kTextSecondary,
+                fontSize: 13,
+              ),
+            ),
+          ],
+          if (hasOutcomes) ...[
+            const SizedBox(height: 8),
+            Wrap(
+              spacing: 6,
+              runSpacing: 6,
+              children: p.outcomes.take(4).map((o) => _skillChip(o)).toList(),
+            ),
+          ],
         ],
       ),
     );
@@ -476,7 +504,7 @@ class _ExplorationScreenState extends State<ExplorationScreen> {
     );
   }
 
-  Widget _shsStrandCard({
+  Widget _shsTrackCard({
     required Key? key,
     required String title,
     required String match,
@@ -703,7 +731,7 @@ class _ExplorationScreenState extends State<ExplorationScreen> {
               SizedBox(width: 8),
               Expanded(
                 child: Text(
-                  'Pick 2–4 interests and get strand suggestions',
+                  'Pick 2–4 interests and get track suggestions',
                   style: TextStyle(
                     fontFamily: 'Poppins',
                     fontWeight: FontWeight.w700,
@@ -767,25 +795,25 @@ class _ExplorationScreenState extends State<ExplorationScreen> {
     );
   }
 
-  void _showRecommendationDialog(List<String> strands) {
+  void _showRecommendationDialog(List<String> trackCodes) {
     showDialog(
       context: context,
       builder:
           (_) => AlertDialog(
-            title: const Text('Suggested Strands'),
+            title: const Text('Suggested Tracks'),
             content: Text(
-              strands.join(' • '),
+              trackCodes.join(' • '),
               style: const TextStyle(
                 fontFamily: 'Poppins',
                 fontWeight: FontWeight.w700,
               ),
             ),
             actions: [
-              for (final code in strands)
+              for (final code in trackCodes)
                 TextButton(
                   onPressed: () {
                     Navigator.pop(context);
-                    _scrollToStrand(code);
+                    _scrollToTrack(code);
                   },
                   child: Text('Go to $code'),
                 ),
@@ -798,10 +826,10 @@ class _ExplorationScreenState extends State<ExplorationScreen> {
     );
   }
 
-  void _showStrandSheet(
+  void _showTrackSheet(
     BuildContext context, {
-    required String strandCode,
-    required String strand,
+    required String trackCode,
+    required String track,
     required String summary,
     required List<String> sampleCurriculum,
     required List<String> entryRoles,
@@ -843,7 +871,7 @@ class _ExplorationScreenState extends State<ExplorationScreen> {
                           const Icon(Icons.school_rounded, color: kPrimaryBlue),
                           const SizedBox(width: 8),
                           Text(
-                            '$strand Strand',
+                            '$track Track',
                             style: const TextStyle(
                               fontFamily: 'Poppins',
                               fontSize: 18,
@@ -878,11 +906,11 @@ class _ExplorationScreenState extends State<ExplorationScreen> {
                       ),
                       const SizedBox(height: 16),
 
-                      _pillHeader('College Pathways for $strand'),
+                      _pillHeader('College Pathways for $track'),
                       const SizedBox(height: 8),
-                      FutureBuilder<List<Map<String, dynamic>>>(
-                        future: SupabaseService.listCoursesForStrandCode(
-                          strandCode,
+                      FutureBuilder<List<PathwayMatch>>(
+                        future: SupabaseService.listPathwaysForStrand(
+                          trackCode,
                         ),
                         builder: (context, s) {
                           if (s.connectionState != ConnectionState.done) {
@@ -895,7 +923,7 @@ class _ExplorationScreenState extends State<ExplorationScreen> {
                             return Padding(
                               padding: const EdgeInsets.all(12),
                               child: Text(
-                                'Failed to load courses: ${s.error}',
+                                'Failed to load pathways: ${s.error}',
                                 style: const TextStyle(fontFamily: 'Inter'),
                               ),
                             );
@@ -905,13 +933,13 @@ class _ExplorationScreenState extends State<ExplorationScreen> {
                             return const Padding(
                               padding: EdgeInsets.all(12),
                               child: Text(
-                                'No courses found yet.',
+                                'No pathways found yet.',
                                 style: TextStyle(fontFamily: 'Inter'),
                               ),
                             );
                           }
                           return Column(
-                            children: rows.map((r) => _courseTile(r)).toList(),
+                            children: rows.map(_pathwayTile).toList(),
                           );
                         },
                       ),
@@ -1083,7 +1111,7 @@ class _Source {
 
 // Local lightweight ViewModel
 class _VM {
-  final Strand? userStrand;
-  final List<Strand> strands;
-  _VM({required this.userStrand, required this.strands});
+  final Track? userTrack;
+  final List<Track> tracks;
+  _VM({required this.userTrack, required this.tracks});
 }
