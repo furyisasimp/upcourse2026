@@ -1,5 +1,4 @@
 // lib/screens/study_guides_screen.dart
-
 import 'dart:io';
 import 'dart:math';
 import 'package:flutter/material.dart';
@@ -8,18 +7,20 @@ import 'package:path_provider/path_provider.dart';
 import 'package:http/http.dart' as http;
 import 'package:career_roadmap/services/supabase_service.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
+import 'package:url_launcher/url_launcher.dart'; // for PPT open + external
 
-// ⬇️ bring in your taskbar
 import '../widgets/custom_taskbar.dart';
 
-// ---- THEME (aligned with your app) ----
-const kPrimaryBlue = Color(0xFF3EB6FF); // brand blue
-const kBgSky = Color(0xFFF2FBFF); // soft sky (matches your taskbar bg)
-const kCardShadow = Color(0x1A000000); // 10% black
+// ---- THEME ----
+const kPrimaryBlue = Color(0xFF3EB6FF);
+const kBgSky = Color(0xFFF2FBFF);
+const kCardShadow = Color(0x1A000000);
 const kTextPrimary = Color(0xFF121212);
 const kTextSecondary = Color(0xFF667085);
-const kAccentChip = Color(0xFFFFF4CC); // soft pastel chip bg
+const kAccentChip = Color(0xFFFFF4CC);
 const kAccentChipBorder = Color(0xFFFFE082);
+
+enum TypeFilter { all, pdf, image, ppt }
 
 class StudyGuidesScreen extends StatefulWidget {
   const StudyGuidesScreen({Key? key}) : super(key: key);
@@ -31,14 +32,15 @@ class StudyGuidesScreen extends StatefulWidget {
 class _StudyGuidesScreenState extends State<StudyGuidesScreen> {
   final _client = http.Client();
 
-  List<FileObject> _files = [];
-  List<FileObject> _filtered = [];
+  List<GuideItem> _all = [];
+  List<GuideItem> _filtered = [];
   bool _loading = true;
   String? _errorMessage;
 
   // UI helpers
   String _query = '';
   bool _grid = false;
+  TypeFilter _filter = TypeFilter.all;
 
   @override
   void initState() {
@@ -59,25 +61,14 @@ class _StudyGuidesScreenState extends State<StudyGuidesScreen> {
     });
 
     try {
-      final files = await Supabase.instance.client.storage
-          .from('my-study-guides')
-          .list(path: ''); // root
-
-      // Keep only PDFs and sort A→Z by name
-      files.retainWhere((f) => f.name.toLowerCase().endsWith('.pdf'));
-      files.sort(
-        (a, b) => a.name.toLowerCase().compareTo(b.name.toLowerCase()),
-      );
-
+      final items = await SupabaseService.listStudyGuides();
       setState(() {
-        _files = files;
-        _filtered = _applyFilter(_files, _query);
+        _all = items;
+        _filtered = _applyFilter(_all, _query, _filter);
         _loading = false;
       });
-
-      debugPrint("✅ Files fetched: ${files.map((f) => f.name).toList()}");
     } catch (e, st) {
-      debugPrint("❌ Error fetching files: $e\n$st");
+      debugPrint("❌ Error fetching study guides: $e\n$st");
       setState(() {
         _errorMessage = e.toString();
         _loading = false;
@@ -85,10 +76,30 @@ class _StudyGuidesScreenState extends State<StudyGuidesScreen> {
     }
   }
 
-  List<FileObject> _applyFilter(List<FileObject> list, String q) {
-    if (q.trim().isEmpty) return list;
-    final ql = q.toLowerCase();
-    return list.where((f) => f.name.toLowerCase().contains(ql)).toList();
+  List<GuideItem> _applyFilter(
+    List<GuideItem> list,
+    String q,
+    TypeFilter filter,
+  ) {
+    Iterable<GuideItem> it = list;
+    switch (filter) {
+      case TypeFilter.pdf:
+        it = it.where((g) => g.type == GuideType.pdf);
+        break;
+      case TypeFilter.image:
+        it = it.where((g) => g.type == GuideType.image);
+        break;
+      case TypeFilter.ppt:
+        it = it.where((g) => g.type == GuideType.ppt);
+        break;
+      case TypeFilter.all:
+        break;
+    }
+    if (q.trim().isNotEmpty) {
+      final ql = q.toLowerCase();
+      it = it.where((g) => g.name.toLowerCase().contains(ql));
+    }
+    return it.toList();
   }
 
   Future<String> _downloadToCache({
@@ -103,10 +114,8 @@ class _StudyGuidesScreenState extends State<StudyGuidesScreen> {
     final safeName = key.replaceAll('/', '_');
     final file = File('${cacheDir.path}/$safeName');
 
-    // already cached
     if (await file.exists()) return file.path;
 
-    // Simple indeterminate progress dialog
     await showDialog(
       context: context,
       barrierDismissible: false,
@@ -131,11 +140,11 @@ class _StudyGuidesScreenState extends State<StudyGuidesScreen> {
       await res.stream.pipe(sink);
       await sink.close();
 
-      if (mounted) Navigator.of(context).pop(); // close dialog
+      if (mounted) Navigator.of(context).pop();
       return file.path;
     } catch (e) {
       if (mounted && Navigator.of(context).canPop()) {
-        Navigator.of(context).pop(); // ensure dialog closes on error
+        Navigator.of(context).pop();
       }
       if (await file.exists()) {
         await file.delete();
@@ -144,58 +153,79 @@ class _StudyGuidesScreenState extends State<StudyGuidesScreen> {
     }
   }
 
-  Future<void> _openPdf(FileObject file) async {
-    try {
-      final key = file.name; // if you add subfolders later, prefix here
-      final pdfUrl = await SupabaseService.getFileUrl(
-        bucket: 'my-study-guides',
-        path: key,
-        expiresIn: 3600,
-      );
-      if (pdfUrl == null) throw 'Failed to get file URL';
-
-      final localPath = await _downloadToCache(url: pdfUrl, key: key);
-
-      if (!mounted) return;
-      Navigator.push(
-        context,
-        MaterialPageRoute(
-          builder: (_) => PdfViewerScreen(path: localPath, title: file.name),
-        ),
-      );
-    } catch (e, st) {
-      debugPrint("❌ Failed to open PDF: $e\n$st");
-      if (!mounted) return;
+  Future<void> _openItem(GuideItem item) async {
+    final url = await SupabaseService.getFileUrl(
+      bucket: 'resources',
+      path: item.path,
+      expiresIn: 3600,
+    );
+    if (url == null) {
       ScaffoldMessenger.of(
         context,
-      ).showSnackBar(SnackBar(content: Text('Failed to open PDF: $e')));
+      ).showSnackBar(const SnackBar(content: Text('Failed to get file URL')));
+      return;
+    }
+
+    if (item.type == GuideType.pdf) {
+      try {
+        final localPath = await _downloadToCache(url: url, key: item.path);
+        if (!mounted) return;
+        Navigator.push(
+          context,
+          MaterialPageRoute(
+            builder: (_) => PdfViewerScreen(path: localPath, title: item.name),
+          ),
+        );
+      } catch (e) {
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text('Failed to open PDF: $e')));
+      }
+      return;
+    }
+
+    if (item.type == GuideType.image) {
+      showDialog(
+        context: context,
+        builder:
+            (_) => Dialog(
+              shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(16),
+              ),
+              child: ClipRRect(
+                borderRadius: BorderRadius.circular(16),
+                child: InteractiveViewer(
+                  child: Image.network(url, fit: BoxFit.contain),
+                ),
+              ),
+            ),
+      );
+      return;
+    }
+
+    // PPT/PPTX – open externally (browser / app chooser)
+    final uri = Uri.parse(url);
+    if (!await launchUrl(uri, mode: LaunchMode.externalApplication)) {
+      await launchUrl(uri, mode: LaunchMode.inAppBrowserView);
     }
   }
 
-  String _prettyName(String raw) {
-    final noExt = raw.replaceAll(RegExp(r'\.pdf$', caseSensitive: false), '');
-    return noExt.replaceAll(RegExp(r'[_\-]+'), ' ');
-  }
+  String _prettyName(String raw) => raw
+      .replaceAll(
+        RegExp(r'\.(pdf|pptx?|png|jpe?g|gif|webp)$', caseSensitive: false),
+        '',
+      )
+      .replaceAll(RegExp(r'[_\-]+'), ' ');
 
-  String _formatBytes(dynamic size) {
-    if (size == null) return '';
-    final s = (size is int) ? size : int.tryParse(size.toString()) ?? 0;
-    if (s <= 0) return '—';
+  String _formatBytes(int? s) {
+    if (s == null || s <= 0) return '—';
     const units = ['B', 'KB', 'MB', 'GB'];
     int i = (log(s) / log(1024)).floor();
     final value = s / pow(1024, i);
     return '${value.toStringAsFixed(value < 10 ? 1 : 0)} ${units[min(i, units.length - 1)]}';
   }
 
-  // Accepts either DateTime? or String? (ISO) — avoids the type error
-  String _formatDate(dynamic dt) {
-    if (dt == null) return '';
-    DateTime? d;
-    if (dt is DateTime) {
-      d = dt;
-    } else if (dt is String) {
-      d = DateTime.tryParse(dt);
-    }
+  String _formatDate(DateTime? d) {
     if (d == null) return '';
     return '${d.year}-${d.month.toString().padLeft(2, '0')}-${d.day.toString().padLeft(2, '0')}';
   }
@@ -205,26 +235,21 @@ class _StudyGuidesScreenState extends State<StudyGuidesScreen> {
   @override
   Widget build(BuildContext context) {
     const pageTitle = 'Study Guides';
-    const pageSubtitle = 'Browse recommended materials';
+    const pageSubtitle = 'Browse study materials';
 
     return Scaffold(
       backgroundColor: kBgSky,
-      // Header styled like your Home top banner (rounded bottom)
       appBar: PreferredSize(
         preferredSize: const Size.fromHeight(120),
         child: _CurvedHeader(
           title: pageTitle,
           subtitle: pageSubtitle,
-          trailing: IconButton(
-            onPressed: () {},
-            icon: const Icon(Icons.info_outline, color: Colors.white),
-            tooltip: 'About',
-          ),
+          trailing: const SizedBox.shrink(),
         ),
       ),
       body: Column(
         children: [
-          // Search + toggle row
+          // Search + toggles + type filter
           Padding(
             padding: const EdgeInsets.fromLTRB(16, 12, 16, 4),
             child: Row(
@@ -234,10 +259,10 @@ class _StudyGuidesScreenState extends State<StudyGuidesScreen> {
                     onChanged:
                         (v) => setState(() {
                           _query = v;
-                          _filtered = _applyFilter(_files, _query);
+                          _filtered = _applyFilter(_all, _query, _filter);
                         }),
                     decoration: InputDecoration(
-                      hintText: 'Search study guides…',
+                      hintText: 'Search by name…',
                       filled: true,
                       fillColor: Colors.white,
                       prefixIcon: const Icon(Icons.search, color: kPrimaryBlue),
@@ -262,9 +287,20 @@ class _StudyGuidesScreenState extends State<StudyGuidesScreen> {
             ),
           ),
 
-          const SizedBox(height: 8),
+          // Type filter chips
+          Padding(
+            padding: const EdgeInsets.fromLTRB(16, 6, 16, 8),
+            child: Wrap(
+              spacing: 8,
+              children: [
+                _typeChip('All', TypeFilter.all),
+                _typeChip('PDFs', TypeFilter.pdf),
+                _typeChip('Images', TypeFilter.image),
+                _typeChip('PPT', TypeFilter.ppt),
+              ],
+            ),
+          ),
 
-          // Content states
           Expanded(
             child: Builder(
               builder: (_) {
@@ -274,43 +310,87 @@ class _StudyGuidesScreenState extends State<StudyGuidesScreen> {
                     label: 'Loading study guides…',
                   );
                 }
-
                 if (_errorMessage != null) {
                   return _ErrorState(
                     message: _errorMessage!,
                     onRetry: _loadFiles,
                   );
                 }
-
-                if (_files.isEmpty) {
+                if (_all.isEmpty) {
                   return const _CenteredState(
                     icon: Icons.menu_book_rounded,
-                    label: 'No study guides yet.\nUpload a PDF to get started!',
+                    label: 'Nothing here yet. Upload to /resources.',
+                  );
+                }
+
+                // When "All" → show grouped sections. Otherwise → single list/grid.
+                if (_filter == TypeFilter.all) {
+                  final imgs =
+                      _filtered
+                          .where((g) => g.type == GuideType.image)
+                          .toList();
+                  final pdfs =
+                      _filtered.where((g) => g.type == GuideType.pdf).toList();
+                  final ppts =
+                      _filtered.where((g) => g.type == GuideType.ppt).toList();
+
+                  return RefreshIndicator(
+                    onRefresh: _onRefresh,
+                    color: kPrimaryBlue,
+                    child: ListView(
+                      padding: const EdgeInsets.fromLTRB(16, 8, 16, 24),
+                      children: [
+                        if (imgs.isNotEmpty) _section('Images', imgs),
+                        if (pdfs.isNotEmpty) _section('PDFs', pdfs),
+                        if (ppts.isNotEmpty) _section('PPT', ppts),
+                        if (imgs.isEmpty && pdfs.isEmpty && ppts.isEmpty)
+                          const _CenteredState(
+                            icon: Icons.search_off_rounded,
+                            label: 'No matches for your search.',
+                          ),
+                      ],
+                    ),
                   );
                 }
 
                 return RefreshIndicator(
                   onRefresh: _onRefresh,
                   color: kPrimaryBlue,
-                  child: _grid ? _buildGrid() : _buildList(),
+                  child: _grid ? _buildGrid(_filtered) : _buildList(_filtered),
                 );
               },
             ),
           ),
         ],
       ),
-
-      // ⬇️ Your custom bottom nav with Resources active
       bottomNavigationBar: const CustomTaskbar(
-        selectedIndex: 1, // Home=0, Resources=1, Quizzes=2, Profile=3
-        onItemTapped: _noop, // navigation handled inside CustomTaskbar
+        selectedIndex: 1,
+        onItemTapped: _noop,
       ),
     );
   }
 
-  // ---- Small UI helpers ----
+  // ---- UI helpers ----
 
   static void _noop(int _) {}
+
+  Widget _typeChip(String label, TypeFilter value) {
+    final active = _filter == value;
+    return ChoiceChip(
+      label: Text(label),
+      selected: active,
+      onSelected: (_) {
+        setState(() {
+          _filter = value;
+          _filtered = _applyFilter(_all, _query, _filter);
+        });
+      },
+      selectedColor: kPrimaryBlue,
+      labelStyle: TextStyle(color: active ? Colors.white : kTextSecondary),
+      backgroundColor: Colors.white,
+      shape: StadiumBorder(side: BorderSide(color: Colors.blue.shade100)),
+    );
+  }
 
   Widget _viewToggle() {
     return Container(
@@ -375,7 +455,12 @@ class _StudyGuidesScreenState extends State<StudyGuidesScreen> {
     );
   }
 
-  Widget _pdfBadge() {
+  Widget _badge(GuideType t) {
+    final icon = switch (t) {
+      GuideType.pdf => Icons.picture_as_pdf,
+      GuideType.image => Icons.photo,
+      GuideType.ppt => Icons.slideshow,
+    };
     return Container(
       width: 42,
       height: 42,
@@ -384,7 +469,7 @@ class _StudyGuidesScreenState extends State<StudyGuidesScreen> {
         color: kPrimaryBlue,
       ),
       alignment: Alignment.center,
-      child: const Icon(Icons.picture_as_pdf, color: Colors.white),
+      child: Icon(icon, color: Colors.white),
     );
   }
 
@@ -422,35 +507,55 @@ class _StudyGuidesScreenState extends State<StudyGuidesScreen> {
     );
   }
 
-  // ---- List/Grid ----
+  // ---- Sectioned rendering for "All" ----
+  Widget _section(String title, List<GuideItem> items) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Padding(
+          padding: const EdgeInsets.symmetric(vertical: 6),
+          child: Text(
+            '$title • ${items.length}',
+            style: const TextStyle(
+              fontWeight: FontWeight.w800,
+              color: kTextPrimary,
+              fontSize: 16,
+            ),
+          ),
+        ),
+        _grid ? _buildGrid(items) : _buildList(items),
+        const SizedBox(height: 10),
+      ],
+    );
+  }
 
-  Widget _buildList() {
+  // ---- List/Grid (single collection) ----
+  Widget _buildList(List<GuideItem> items) {
     return ListView.separated(
-      physics: const AlwaysScrollableScrollPhysics(),
-      itemCount: _filtered.length,
-      padding: const EdgeInsets.fromLTRB(16, 8, 16, 24),
+      physics: const NeverScrollableScrollPhysics(),
+      shrinkWrap: true,
+      itemCount: items.length,
       separatorBuilder: (_, __) => const SizedBox(height: 12),
       itemBuilder: (context, index) {
-        final file = _filtered[index];
-        final meta = (file.metadata ?? const {}) as Map<String, dynamic>;
-        final size = _formatBytes(meta['size']);
-        final updated = _formatDate(file.updatedAt ?? file.createdAt);
+        final g = items[index];
+        final size = _formatBytes(g.size);
+        final updated = _formatDate(g.updated);
 
         return InkWell(
-          onTap: () => _openPdf(file),
+          onTap: () => _openItem(g),
           borderRadius: BorderRadius.circular(16),
           child: _cardContainer(
             padding: const EdgeInsets.all(14),
             child: Row(
               children: [
-                _pdfBadge(),
+                _badge(g.type),
                 const SizedBox(width: 12),
                 Expanded(
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
                       Text(
-                        _prettyName(file.name),
+                        _prettyName(g.name),
                         maxLines: 1,
                         overflow: TextOverflow.ellipsis,
                         style: const TextStyle(
@@ -482,34 +587,34 @@ class _StudyGuidesScreenState extends State<StudyGuidesScreen> {
     );
   }
 
-  Widget _buildGrid() {
+  Widget _buildGrid(List<GuideItem> items) {
     return GridView.builder(
-      padding: const EdgeInsets.fromLTRB(16, 8, 16, 24),
-      physics: const AlwaysScrollableScrollPhysics(),
+      shrinkWrap: true,
+      physics: const NeverScrollableScrollPhysics(),
+      padding: EdgeInsets.zero,
       gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
         crossAxisCount: 2,
         mainAxisSpacing: 12,
         crossAxisSpacing: 12,
         childAspectRatio: 3 / 2,
       ),
-      itemCount: _filtered.length,
+      itemCount: items.length,
       itemBuilder: (context, index) {
-        final file = _filtered[index];
-        final meta = (file.metadata ?? const {}) as Map<String, dynamic>;
-        final size = _formatBytes(meta['size']);
-        final updated = _formatDate(file.updatedAt ?? file.createdAt);
+        final g = items[index];
+        final size = _formatBytes(g.size);
+        final updated = _formatDate(g.updated);
 
         return InkWell(
           borderRadius: BorderRadius.circular(16),
-          onTap: () => _openPdf(file),
+          onTap: () => _openItem(g),
           child: _cardContainer(
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                _pdfBadge(),
+                _badge(g.type),
                 const SizedBox(height: 10),
                 Text(
-                  _prettyName(file.name),
+                  _prettyName(g.name),
                   maxLines: 2,
                   overflow: TextOverflow.ellipsis,
                   style: const TextStyle(
@@ -536,7 +641,7 @@ class _StudyGuidesScreenState extends State<StudyGuidesScreen> {
   }
 }
 
-// ---- Curved blue header like your Home screen ----
+// ---- Curved header, states, and PDF viewer (unchanged except title) ----
 class _CurvedHeader extends StatelessWidget {
   final String title;
   final String subtitle;
@@ -567,13 +672,12 @@ class _CurvedHeader extends StatelessWidget {
         child: Row(
           mainAxisAlignment: MainAxisAlignment.spaceBetween,
           children: [
-            // Title + subtitle
             Expanded(
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
                   Text(
-                    title, // "Study Guides"
+                    title,
                     maxLines: 1,
                     overflow: TextOverflow.ellipsis,
                     style: const TextStyle(
@@ -606,13 +710,10 @@ class _CurvedHeader extends StatelessWidget {
   }
 }
 
-// ---- Friendly states ----
 class _CenteredState extends StatelessWidget {
   final IconData icon;
   final String label;
-
   const _CenteredState({required this.icon, required this.label});
-
   @override
   Widget build(BuildContext context) {
     return Center(
@@ -638,9 +739,7 @@ class _CenteredState extends StatelessWidget {
 class _ErrorState extends StatelessWidget {
   final String message;
   final VoidCallback onRetry;
-
   const _ErrorState({required this.message, required this.onRetry});
-
   @override
   Widget build(BuildContext context) {
     return Center(
@@ -685,10 +784,8 @@ class _ErrorState extends StatelessWidget {
 class PdfViewerScreen extends StatelessWidget {
   final String path;
   final String title;
-
   const PdfViewerScreen({Key? key, required this.path, required this.title})
     : super(key: key);
-
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -707,13 +804,11 @@ class PdfViewerScreen extends StatelessWidget {
         autoSpacing: true,
         pageFling: true,
         onError: (error) {
-          debugPrint("❌ PDF view error: $error");
           ScaffoldMessenger.of(
             context,
           ).showSnackBar(SnackBar(content: Text('PDF view error: $error')));
         },
         onPageError: (page, error) {
-          debugPrint("❌ Error on page $page: $error");
           ScaffoldMessenger.of(context).showSnackBar(
             SnackBar(content: Text('Error on page $page: $error')),
           );

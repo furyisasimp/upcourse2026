@@ -37,8 +37,13 @@ class HomeScreenState extends State<HomeScreen> {
   bool _riasecDone = false;
 
   // ---- Quiz progress state (ONLY quizzes) ----
-  // switched to completed + total (instead of in_progress)
-  Map<String, int> _quizStats = const {'completed': 0, 'total': 0};
+  // three buckets + total
+  Map<String, int> _quizStats = const {
+    'to_review': 0,
+    'returned': 0,
+    'not_started': 0,
+    'total': 0,
+  };
   final List<_QuizRow> _quizRows = [];
   bool _loadingQuizzes = true;
 
@@ -122,14 +127,46 @@ class HomeScreenState extends State<HomeScreen> {
     }
   }
 
+  // ---------- Derive the only three display states we care about ----------
+  // Returns one of: 'to_be_reviewed' | 'returned' | 'not_started' | 'locked'
+  String _deriveStatus({
+    required String? progressStatus,
+    required Map<String, dynamic>? latestAttempt,
+  }) {
+    final ps = (progressStatus ?? '').toLowerCase().trim();
+    final la = latestAttempt ?? const {};
+    final laStatus = (la['status'] ?? '').toString().toLowerCase();
+
+    if (ps == 'locked') return 'locked';
+
+    if (laStatus == 'pending_review' || laStatus == 'to_be_reviewed') {
+      return 'to_be_reviewed';
+    }
+    if (laStatus == 'returned') {
+      return 'returned';
+    }
+
+    if (ps == 'to_be_reviewed' || ps == 'pending_review')
+      return 'to_be_reviewed';
+    if (ps == 'returned') return 'returned';
+
+    return 'not_started';
+  }
+
   /// Build quiz progress from:
   /// - Storage bucket 'quizzes' (discover quiz ids)
-  /// - Table 'quiz_progress' (user rows) with fields: user_id, quiz_id, status, score
+  /// - Table 'quiz_progress' (user rows)
+  /// - Table 'quiz_attempts' (latest attempt via service helper)
   Future<void> _loadQuizProgress() async {
     setState(() {
       _loadingQuizzes = true;
       _quizRows.clear();
-      _quizStats = const {'completed': 0, 'total': 0};
+      _quizStats = const {
+        'to_review': 0,
+        'returned': 0,
+        'not_started': 0,
+        'total': 0,
+      };
     });
 
     final uid = SupabaseService.authUserId;
@@ -153,7 +190,8 @@ class HomeScreenState extends State<HomeScreen> {
         ids.addAll(['ABM', 'GAS', 'STEM', 'TECHPRO']);
       }
 
-      Map<String, dynamic> byQuiz = {};
+      // Fetch progress rows once
+      final Map<String, dynamic> byQuiz = {};
       if (uid != null) {
         final rows = await supa
             .from('quiz_progress')
@@ -167,32 +205,68 @@ class HomeScreenState extends State<HomeScreen> {
         }
       }
 
-      int completed = 0;
+      // Build rows (bring along score for rings)
+      final futures =
+          ids.map((id) async {
+            final progress = Map<String, dynamic>.from(
+              byQuiz[id] as Map? ?? const {},
+            );
+            final attempt = await SupabaseService.getLatestAttemptForQuiz(
+              quizIdExact: id,
+            );
 
-      for (final id in ids) {
-        final row = byQuiz[id] ?? {};
-        final status =
-            (row['status'] ?? 'not_started').toString().toLowerCase();
-        final int? score =
-            row['score'] is num ? (row['score'] as num).toInt() : null;
+            // derive status for list
+            final status = _deriveStatus(
+              progressStatus: progress['status']?.toString(),
+              latestAttempt: attempt,
+            );
 
-        if (status == 'completed') {
-          completed++;
+            // score for rings: prefer attempt.score_pct; fall back to progress.score
+            int? score;
+            final num? pct = attempt?['score_pct'] as num?;
+            if (pct != null) {
+              score = pct.toDouble().clamp(0, 100).round();
+            } else if (progress['score'] is num) {
+              score = (progress['score'] as num).toInt().clamp(0, 100);
+            }
+
+            return _QuizRow(
+              id: id,
+              title: _metaTitle[id] ?? '$id — Practice Quiz',
+              status:
+                  status, // to_be_reviewed | returned | not_started | locked
+              score: score,
+            );
+          }).toList();
+
+      final rows = await Future.wait(futures);
+
+      // Tally buckets
+      int toReview = 0, returned = 0, notStarted = 0;
+      for (final r in rows) {
+        switch (r.status) {
+          case 'to_be_reviewed':
+            toReview++;
+            break;
+          case 'returned':
+            returned++;
+            break;
+          case 'not_started':
+          case 'locked':
+            notStarted++;
+            break;
         }
-
-        _quizRows.add(
-          _QuizRow(
-            id: id,
-            title: _metaTitle[id] ?? '$id — Practice Quiz',
-            status: status, // completed | in_progress | not_started
-            score: score,
-          ),
-        );
       }
 
       if (!mounted) return;
       setState(() {
-        _quizStats = {'completed': completed, 'total': ids.length};
+        _quizRows.addAll(rows);
+        _quizStats = {
+          'to_review': toReview,
+          'returned': returned,
+          'not_started': notStarted,
+          'total': ids.length,
+        };
         _loadingQuizzes = false;
       });
     } catch (e) {
@@ -228,7 +302,6 @@ class HomeScreenState extends State<HomeScreen> {
   }
 
   Future<void> _startNcaeFlow() async {
-    // Still navigable if you keep the screen, but not counted in progress
     final result = await _goTo<bool>(const QuestionnaireScreen());
     if (result == true) {
       if (!mounted) return;
@@ -624,7 +697,7 @@ class HomeScreenState extends State<HomeScreen> {
     );
   }
 
-  // ======= STAT CHIP (responsive, no overflow) =======
+  // ======= STAT CHIP =======
   Widget _statChip({
     required IconData icon,
     required String label,
@@ -656,19 +729,25 @@ class HomeScreenState extends State<HomeScreen> {
   }
 
   Widget _progressCard() {
-    final completed = _quizStats['completed'] ?? 0;
+    final toReview = _quizStats['to_review'] ?? 0;
+    final returned = _quizStats['returned'] ?? 0;
+    final notStarted = _quizStats['not_started'] ?? 0;
     final total = _quizStats['total'] ?? 0;
     final safeTotal = total == 0 ? 1 : total;
 
-    // Average score among completed quizzes only
+    // RING 1: average score across quizzes that have a score
+    final rowsWithScore = _quizRows.where((r) => r.score != null).toList();
+    final doneCount = rowsWithScore.length;
     final avgScore =
-        _quizRows
-            .where((r) => r.status == 'completed' && r.score != null)
-            .map((r) => r.score!)
-            .fold<int>(0, (p, s) => p + s) /
-        (completed == 0 ? 1 : completed);
+        doneCount == 0
+            ? 0.0
+            : rowsWithScore
+                    .map((r) => r.score!.toDouble())
+                    .reduce((a, b) => a + b) /
+                doneCount;
 
-    final completionPct = (completed / safeTotal).clamp(0.0, 1.0);
+    // RING 2: total quizzes done (have a score)
+    final donePct = (doneCount / safeTotal).clamp(0.0, 1.0);
 
     return Container(
       width: double.infinity,
@@ -697,53 +776,44 @@ class HomeScreenState extends State<HomeScreen> {
           ),
           const SizedBox(height: 14),
 
-          // ── Stats chips (Completed / Total) ─────────────
+          // ── Stats chips (Not started / To be reviewed / Returned / Total) ─
           Wrap(
             spacing: 12,
             runSpacing: 8,
             children: [
               _statChip(
-                icon: Icons.check_circle,
-                label: '$completed Completed',
-                bg: const Color(0xFFEFF9F2),
-                fg: const Color(0xFF2E7D32),
+                icon: Icons.hourglass_empty_rounded,
+                label: '$notStarted Not started',
+                bg: const Color(0xFFF5F7FA),
+                fg: const Color(0xFF6B7280),
+              ),
+              _statChip(
+                icon: Icons.rate_review_outlined,
+                label: '$toReview To be reviewed',
+                bg: const Color(0xFFEFF3FF),
+                fg: const Color(0xFF2A6FE4),
+              ),
+              _statChip(
+                icon: Icons.reply_rounded,
+                label: '$returned Returned',
+                bg: const Color(0xFFFFF5E6),
+                fg: const Color(0xFFB15E09),
               ),
               _statChip(
                 icon: Icons.list_alt_rounded,
                 label: '$total Total Quizzes',
-                bg: const Color(0xFFFFF8E1),
-                fg: const Color(0xFFB28704),
+                bg: const Color(0xFFEFF7FF),
+                fg: const Color(0xFF0F6CBD),
               ),
             ],
           ),
 
           const SizedBox(height: 16),
 
-          // ── Big ring + average score (with labels) ─────────────
+          // ── Rings ─────────────────────────────────────────────
           Row(
             mainAxisAlignment: MainAxisAlignment.spaceAround,
             children: [
-              CircularPercentIndicator(
-                radius: 54,
-                lineWidth: 10,
-                percent: completionPct,
-                center: Text(
-                  '${(completionPct * 100).toStringAsFixed(0)}%',
-                  style: const TextStyle(
-                    fontFamily: 'RobotoMono',
-                    fontWeight: FontWeight.bold,
-                  ),
-                ),
-                progressColor: const Color(0xFF3EB6FF),
-                backgroundColor: Colors.grey.shade200,
-                footer: const Padding(
-                  padding: EdgeInsets.only(top: 8.0),
-                  child: Text(
-                    'Completion',
-                    style: TextStyle(fontFamily: 'Inter', fontSize: 12.5),
-                  ),
-                ),
-              ),
               CircularPercentIndicator(
                 radius: 54,
                 lineWidth: 10,
@@ -765,6 +835,27 @@ class HomeScreenState extends State<HomeScreen> {
                   ),
                 ),
               ),
+              CircularPercentIndicator(
+                radius: 54,
+                lineWidth: 10,
+                percent: donePct,
+                center: Text(
+                  '${(donePct * 100).toStringAsFixed(0)}%',
+                  style: const TextStyle(
+                    fontFamily: 'RobotoMono',
+                    fontWeight: FontWeight.bold,
+                  ),
+                ),
+                progressColor: const Color(0xFF2A6FE4),
+                backgroundColor: Colors.grey.shade200,
+                footer: Padding(
+                  padding: const EdgeInsets.only(top: 8.0),
+                  child: Text(
+                    'Quizzes Done • $doneCount/$total',
+                    style: const TextStyle(fontFamily: 'Inter', fontSize: 12.5),
+                  ),
+                ),
+              ),
             ],
           ),
 
@@ -783,11 +874,7 @@ class HomeScreenState extends State<HomeScreen> {
               children:
                   _quizRows
                       .map(
-                        (r) => _quizListTile(
-                          title: r.title,
-                          status: r.status,
-                          score: r.score,
-                        ),
+                        (r) => _quizListTile(title: r.title, status: r.status),
                       )
                       .toList(),
             ),
@@ -796,25 +883,26 @@ class HomeScreenState extends State<HomeScreen> {
     );
   }
 
-  Widget _quizListTile({
-    required String title,
-    required String status,
-    int? score,
-  }) {
+  Widget _quizListTile({required String title, required String status}) {
     Color badgeBg;
     Color badgeFg;
     String badgeText;
 
     switch (status) {
-      case 'completed':
-        badgeBg = const Color(0xFFEFF9F2);
-        badgeFg = const Color(0xFF2E7D32);
-        badgeText = score != null ? 'Completed • $score%' : 'Completed';
-        break;
-      case 'in_progress':
+      case 'to_be_reviewed':
         badgeBg = const Color(0xFFEFF3FF);
         badgeFg = const Color(0xFF2A6FE4);
-        badgeText = 'In progress';
+        badgeText = 'To be reviewed';
+        break;
+      case 'returned':
+        badgeBg = const Color(0xFFFFF5E6);
+        badgeFg = const Color(0xFFB15E09);
+        badgeText = 'Returned';
+        break;
+      case 'locked':
+        badgeBg = const Color(0xFFF3F4F6);
+        badgeFg = const Color(0xFF6B7280);
+        badgeText = 'Locked';
         break;
       default:
         badgeBg = Colors.grey.shade100;
@@ -893,8 +981,8 @@ class HomeScreenState extends State<HomeScreen> {
 class _QuizRow {
   final String id;
   final String title;
-  final String status; // completed | in_progress | not_started
-  final int? score;
+  final String status; // to_be_reviewed | returned | not_started | locked
+  final int? score; // 0–100 if available
   _QuizRow({
     required this.id,
     required this.title,

@@ -185,8 +185,10 @@ class ProfileDetailsScreenState extends State<ProfileDetailsScreen> {
     final String lastName = (_profileData?['last_name'] ?? '').toString();
     final String gradeLevel =
         (_profileData?['grade_level'] ?? '').toString().trim();
-    final String school = (_profileData?['school'] ?? 'N/A').toString();
     final String email = (SupabaseService.authEmail ?? 'N/A').toString();
+
+    // NEW: Section
+    final String section = (_profileData?['section'] ?? '').toString().trim();
 
     // NEW: Track & Course (from normalized service fields)
     final String track =
@@ -262,9 +264,9 @@ class ProfileDetailsScreenState extends State<ProfileDetailsScreen> {
                       const SizedBox(height: 12),
                       _ChipsRow(
                         gradeLevel: gradeLevel,
-                        school: school,
                         track: track,
                         course: course,
+                        section: section,
                       ),
                     ],
                   )
@@ -291,9 +293,9 @@ class ProfileDetailsScreenState extends State<ProfileDetailsScreen> {
                             const SizedBox(height: 12),
                             _ChipsRow(
                               gradeLevel: gradeLevel,
-                              school: school,
                               track: track,
                               course: course,
+                              section: section,
                             ),
                           ],
                         ),
@@ -317,13 +319,14 @@ class ProfileDetailsScreenState extends State<ProfileDetailsScreen> {
               'Grade Level',
               gradeLevel.isNotEmpty ? 'Grade $gradeLevel' : '—',
             ),
+            _infoRow('Section', section.ifEmpty('—')),
             _infoRow('Email', email.ifEmpty('—')),
 
             const SizedBox(height: 6),
             const Divider(height: 1),
             const SizedBox(height: 6),
 
-            // NEW: Track & Course lines
+            // Track & Course lines
             _infoRow('Track', track.ifEmpty('—')),
             _infoRow('Course', course.ifEmpty('—')),
           ],
@@ -348,7 +351,7 @@ class ProfileDetailsScreenState extends State<ProfileDetailsScreen> {
               onTap: _fetchUserProfile,
             ),
             _divider(),
-            // NEW: logout at the bottom
+            // logout at the bottom
             InkWell(
               borderRadius: BorderRadius.circular(10),
               onTap: _confirmLogout,
@@ -700,24 +703,27 @@ class _NameAndRole extends StatelessWidget {
 
 class _ChipsRow extends StatelessWidget {
   final String gradeLevel;
-  final String school;
 
-  // NEW: show track & course chips if present
+  // show track & course chips if present
   final String? track;
   final String? course;
 
+  // section chip
+  final String? section;
+
   const _ChipsRow({
     required this.gradeLevel,
-    required this.school,
     this.track,
     this.course,
+    this.section,
   });
 
   @override
   Widget build(BuildContext context) {
     final chips = <Widget>[
       if (gradeLevel.isNotEmpty) _chip('Grade $gradeLevel'),
-      if (school.trim().isNotEmpty && school != 'N/A') _chip(school),
+      if ((section ?? '').trim().isNotEmpty)
+        _chip('Section: ${section!.trim()}'),
       if ((track ?? '').trim().isNotEmpty) _chip('Track: ${track!.trim()}'),
       if ((course ?? '').trim().isNotEmpty) _chip(course!.trim()),
     ];

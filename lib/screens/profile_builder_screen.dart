@@ -24,15 +24,38 @@ class ProfileBuilderScreenState extends State<ProfileBuilderScreen> {
   final TextEditingController _middleNameController = TextEditingController();
   final TextEditingController _lastNameController = TextEditingController();
   final TextEditingController _suffixController = TextEditingController();
+
+  // We’ll keep this controller to remain compatible with your payload,
+  // but the UI will be a dropdown. We keep it in sync with the selection.
   final TextEditingController _genderController = TextEditingController();
+
   final TextEditingController _usernameController = TextEditingController();
   final TextEditingController _streetController = TextEditingController();
   final TextEditingController _brgyController = TextEditingController();
   final TextEditingController _cityController = TextEditingController();
   final TextEditingController _provinceController = TextEditingController();
   final TextEditingController _gradeLevelController = TextEditingController();
+  final TextEditingController _sectionController = TextEditingController();
   final TextEditingController _highSchoolLevelController =
       TextEditingController();
+
+  // Gender dropdown state
+  String? _genderValue;
+  final List<String> _genderOptions = const [
+    'Woman',
+    'Man',
+    'Non-binary',
+    'Transgender Woman',
+    'Transgender Man',
+    'Agender',
+    'Genderqueer',
+    'Genderfluid',
+    'Two-Spirit',
+    'Intersex',
+    'Prefer not to say',
+    'Self-describe',
+  ];
+  final TextEditingController _customGenderController = TextEditingController();
 
   bool _isSaving = false;
 
@@ -49,6 +72,7 @@ class ProfileBuilderScreenState extends State<ProfileBuilderScreen> {
     _lastNameController.dispose();
     _suffixController.dispose();
     _genderController.dispose();
+    _customGenderController.dispose();
     _usernameController.dispose();
     _streetController.dispose();
     _brgyController.dispose();
@@ -56,6 +80,7 @@ class ProfileBuilderScreenState extends State<ProfileBuilderScreen> {
     _provinceController.dispose();
     _gradeLevelController.removeListener(_updateHighSchoolLevel);
     _gradeLevelController.dispose();
+    _sectionController.dispose();
     _highSchoolLevelController.dispose();
     super.dispose();
   }
@@ -112,6 +137,15 @@ class ProfileBuilderScreenState extends State<ProfileBuilderScreen> {
       );
     }
 
+    // Resolve gender value (dropdown or self-described)
+    final String genderValue =
+        (_genderValue == 'Self-describe')
+            ? _customGenderController.text.trim()
+            : (_genderValue ?? '').trim();
+
+    // keep controller in sync (if other parts of app read it)
+    _genderController.text = genderValue;
+
     final profileData = {
       'supabase_id': widget.userId, // ✅ Correct column name
       'first_name': _firstNameController.text.trim(),
@@ -119,13 +153,14 @@ class ProfileBuilderScreenState extends State<ProfileBuilderScreen> {
       'last_name': _lastNameController.text.trim(),
       'suffix': _suffixController.text.trim(),
       'birthdate': _selectedDate?.toIso8601String() ?? '',
-      'gender': _genderController.text.trim(),
+      'gender': genderValue,
       'username': _usernameController.text.trim(),
       'street': _streetController.text.trim(),
       'brgy': _brgyController.text.trim(),
       'city': _cityController.text.trim(),
       'province': _provinceController.text.trim(),
       'grade_level': _gradeLevelController.text.trim(),
+      'section': _sectionController.text.trim(),
       'school_level': _highSchoolLevelController.text.trim(),
       if (avatarUrl != null) 'profile_picture': avatarUrl,
     };
@@ -164,6 +199,8 @@ class ProfileBuilderScreenState extends State<ProfileBuilderScreen> {
 
   @override
   Widget build(BuildContext context) {
+    final bool isSelfDescribe = _genderValue == 'Self-describe';
+
     return Scaffold(
       appBar: AppBar(
         title: const Text(
@@ -206,42 +243,85 @@ class ProfileBuilderScreenState extends State<ProfileBuilderScreen> {
                         ),
                       ),
                       const SizedBox(height: 20),
+
+                      // --- Name fields with placeholders ---
                       _buildTextField(
                         'First Name',
                         controller: _firstNameController,
+                        hintText: 'e.g., Juan',
                       ),
                       _buildTextField(
                         'Middle Name',
                         controller: _middleNameController,
+                        hintText: 'e.g., Dela Cruz',
                       ),
                       _buildTextField(
                         'Last Name',
                         controller: _lastNameController,
+                        hintText: 'e.g., Reyes',
                       ),
                       _buildTextField('Suffix', controller: _suffixController),
-                      _buildTextField('Gender', controller: _genderController),
+
+                      // --- Gender dropdown (LGBTQIA+ inclusive) ---
+                      _buildGenderDropdown(
+                        value: _genderValue,
+                        onChanged: (val) {
+                          setState(() {
+                            _genderValue = val;
+                          });
+                        },
+                      ),
+
+                      if (isSelfDescribe)
+                        _buildTextField(
+                          'Self-described Gender',
+                          controller: _customGenderController,
+                          hintText: 'e.g., Pangender',
+                        ),
+
                       _buildDateField(context),
+
+                      // --- Username with placeholder ---
                       _buildTextField(
                         'Username',
                         controller: _usernameController,
+                        hintText: 'e.g., juan.reyes11',
                       ),
+
+                      // --- Address ---
                       _buildTextField('Street', controller: _streetController),
                       _buildTextField('Brgy', controller: _brgyController),
                       _buildTextField('City', controller: _cityController),
+
+                      // --- Province with placeholder ---
                       _buildTextField(
                         'Province',
                         controller: _provinceController,
+                        hintText: 'e.g., Bulacan',
                       ),
+
+                      // --- Grade level with placeholder ---
                       _buildTextField(
                         'Grade Level (7 - 12)',
                         controller: _gradeLevelController,
                         keyboardType: TextInputType.number,
+                        hintText: 'e.g., 11',
                       ),
+
+                      // --- Section name only with placeholder ---
+                      _buildTextField(
+                        'Section',
+                        controller: _sectionController,
+                        hintText: 'e.g., Einstein (no grade level)',
+                      ),
+
+                      // --- Derived school level (disabled) ---
                       _buildTextField(
                         'High School Level',
                         controller: _highSchoolLevelController,
                         enabled: false,
                       ),
+
                       const SizedBox(height: 20),
                       Center(
                         child: ElevatedButton(
@@ -262,11 +342,14 @@ class ProfileBuilderScreenState extends State<ProfileBuilderScreen> {
     );
   }
 
+  // ---------- Widgets & Helpers ----------
+
   Widget _buildTextField(
     String label, {
     TextEditingController? controller,
     TextInputType keyboardType = TextInputType.text,
     bool enabled = true,
+    String? hintText,
   }) {
     return Padding(
       padding: const EdgeInsets.symmetric(vertical: 8.0),
@@ -277,11 +360,53 @@ class ProfileBuilderScreenState extends State<ProfileBuilderScreen> {
         style: const TextStyle(fontFamily: 'Inter'),
         decoration: InputDecoration(
           labelText: label,
+          hintText: hintText,
           labelStyle: const TextStyle(fontFamily: 'Inter', fontSize: 16),
           filled: true,
           fillColor: enabled ? Colors.white : Colors.grey[200],
           border: OutlineInputBorder(borderRadius: BorderRadius.circular(10)),
         ),
+      ),
+    );
+  }
+
+  Widget _buildGenderDropdown({
+    required String? value,
+    required ValueChanged<String?> onChanged,
+  }) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 8.0),
+      child: DropdownButtonFormField<String>(
+        value: value,
+        isExpanded: true,
+        decoration: InputDecoration(
+          labelText: 'Gender',
+          hintText: 'Select gender',
+          labelStyle: const TextStyle(fontFamily: 'Inter', fontSize: 16),
+          filled: true,
+          fillColor: Colors.white,
+          border: OutlineInputBorder(borderRadius: BorderRadius.circular(10)),
+          contentPadding: const EdgeInsets.symmetric(
+            horizontal: 12,
+            vertical: 14,
+          ),
+        ),
+        items:
+            _genderOptions
+                .map(
+                  (g) => DropdownMenuItem<String>(
+                    value: g,
+                    child: Text(g, style: const TextStyle(fontFamily: 'Inter')),
+                  ),
+                )
+                .toList(),
+        onChanged: (val) {
+          // Keep local state and controller in sync
+          onChanged(val);
+          if (val != null && val != 'Self-describe') {
+            _customGenderController.clear();
+          }
+        },
       ),
     );
   }

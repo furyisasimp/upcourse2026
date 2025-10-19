@@ -2,13 +2,57 @@
 import 'dart:math';
 import 'dart:typed_data';
 import 'dart:convert';
+import 'package:intl/intl.dart';
 
 import 'package:supabase_flutter/supabase_flutter.dart';
 
-// IMPORTANT: Only import Track from your models. The others are defined below.
+// Track models.
 import 'package:career_roadmap/models/exploration_models.dart' show Track;
 
 final supa = Supabase.instance.client;
+
+/// Minimal header QuizIntroScreen.
+class QuizHeader {
+  final String quizId;
+  final String title;
+  final String description;
+  final DateTime? dueDateUtc;
+  final int totalPoints;
+  final int questionCount;
+
+  const QuizHeader({
+    required this.quizId,
+    required this.title,
+    required this.description,
+    required this.dueDateUtc,
+    required this.totalPoints,
+    required this.questionCount,
+  });
+
+  factory QuizHeader.fromMeta(Map<String, dynamic> m) {
+    return QuizHeader(
+      quizId: (m['quiz_id'] ?? '').toString(),
+      title: (m['quiz_title'] ?? '').toString(),
+      description: (m['quiz_description'] ?? '').toString(),
+      dueDateUtc: m['due_date'] is DateTime ? m['due_date'] as DateTime : null,
+      totalPoints:
+          (m['total_points'] is num) ? (m['total_points'] as num).toInt() : 0,
+      questionCount:
+          (m['question_count'] is num)
+              ? (m['question_count'] as num).toInt()
+              : 0,
+    );
+  }
+}
+
+class DisabledAccountException implements Exception {
+  final String message;
+  const DisabledAccountException([
+    this.message = 'Your account has been disabled.',
+  ]);
+  @override
+  String toString() => message;
+}
 
 // ---- tiny debug helper (optional) ----
 void _d(String msg) {
@@ -53,6 +97,25 @@ class SourceLink {
   );
 
   Map<String, dynamic> toJson() => {'name': name, 'url': url};
+}
+
+// ---- Study Guide listing (resources bucket) ----
+enum GuideType { pdf, image, ppt }
+
+class GuideItem {
+  final String name; // e.g., "chapter_1.pdf"
+  final String path; // e.g., "pdf/chapter_1.pdf"
+  final int? size; // bytes (if available)
+  final DateTime? updated; // last modified if available
+  final GuideType type;
+
+  const GuideItem({
+    required this.name,
+    required this.path,
+    required this.type,
+    this.size,
+    this.updated,
+  });
 }
 
 /// Strand row (from view `v_strands_shs` OR table `strands`)
@@ -178,6 +241,7 @@ class SupabaseService {
         'supabase_id': uid,
         'email': email,
         'created_at': DateTime.now().toIso8601String(),
+        'is_disabled': false, // ← ensure a concrete default
       });
 
       await supa.from('skill_progress').upsert([
@@ -229,11 +293,476 @@ class SupabaseService {
   }
 
   static Future<AuthResponse> loginUser(String email, String password) async {
-    return await supa.auth.signInWithPassword(email: email, password: password);
+    // Sign in first (Supabase needs a session before we can read the users table via RLS)
+    final res = await supa.auth.signInWithPassword(
+      email: email,
+      password: password,
+    );
+
+    // If sign-in succeeded, immediately check the flag
+    if (res.user != null) {
+      final disabled = await _isCurrentUserDisabled();
+      if (disabled) {
+        // Kill the session so the app is locked out
+        await supa.auth.signOut();
+        // Surface a friendly, typed error the UI can catch and show
+        throw const DisabledAccountException(
+          'Your account has been disabled. Please contact your school or the system administrator.',
+        );
+      }
+    }
+
+    return res;
   }
 
   static Future<void> signOut() async {
     await supa.auth.signOut();
+  }
+
+  /// List a single folder from a bucket.
+  static Future<List<FileObject>> listFolder({
+    required String bucket,
+    required String folder,
+  }) async {
+    return await supa.storage.from(bucket).list(path: folder);
+  }
+
+  /// Read images/, pdf/, ppt/ under the `resources` bucket and normalize them.
+  static Future<List<GuideItem>> listStudyGuides() async {
+    const bucket = 'resources';
+
+    // visibility & extension filters
+    bool _isVisible(FileObject f) =>
+        !f.name.endsWith('/') && !f.name.startsWith('.');
+
+    bool _hasExt(FileObject f, List<String> exts) {
+      final n = f.name.toLowerCase();
+      return exts.any((e) => n.endsWith(e));
+    }
+
+    // fetch + filter per folder
+    final images =
+        (await listFolder(bucket: bucket, folder: 'images'))
+            .where(_isVisible)
+            .where(
+              (f) => _hasExt(f, [
+                '.png',
+                '.jpg',
+                '.jpeg',
+                '.gif',
+                '.webp',
+                '.bmp',
+                '.tiff',
+                '.svg',
+              ]),
+            )
+            .toList();
+
+    final pdfs =
+        (await listFolder(
+          bucket: bucket,
+          folder: 'pdf',
+        )).where(_isVisible).where((f) => _hasExt(f, ['.pdf'])).toList();
+
+    final ppts =
+        (await listFolder(bucket: bucket, folder: 'ppt'))
+            .where(_isVisible)
+            .where((f) => _hasExt(f, ['.ppt', '.pptx', '.key']))
+            .toList();
+
+    // coercers
+    DateTime? _dt(dynamic v) =>
+        v is DateTime ? v : (v is String ? DateTime.tryParse(v) : null);
+    int? _size(dynamic v) => v is num ? v.toInt() : int.tryParse('$v');
+
+    GuideItem mapObj(FileObject o, GuideType t, String folder) => GuideItem(
+      name: o.name,
+      path: '$folder/${o.name}',
+      type: t,
+      size: _size(o.metadata?['size']),
+      updated: _dt(o.updatedAt) ?? _dt(o.createdAt),
+    );
+
+    final out = <GuideItem>[
+      ...images.map((o) => mapObj(o, GuideType.image, 'images')),
+      ...pdfs.map((o) => mapObj(o, GuideType.pdf, 'pdf')),
+      ...ppts.map((o) => mapObj(o, GuideType.ppt, 'ppt')),
+    ];
+
+    out.sort((a, b) => a.name.toLowerCase().compareTo(b.name.toLowerCase()));
+    return out;
+  }
+
+  static Future<bool> _isCurrentUserDisabled() async {
+    final uid = supa.auth.currentUser?.id;
+    if (uid == null) return false; // not signed in yet
+    try {
+      final row =
+          await supa
+              .from('users')
+              .select('is_disabled')
+              .eq('supabase_id', uid)
+              .maybeSingle();
+
+      // Treat only TRUE as disabled. NULL or FALSE => allowed.
+      return row != null && (row['is_disabled'] == true);
+    } catch (_) {
+      // Fail-open on read error; you can flip this to fail-closed if you prefer
+      return false;
+    }
+  }
+
+  /// Singleton client accessor
+  static SupabaseClient get supa => Supabase.instance.client;
+
+  // Build a QuizHeader from your existing getQuizIntroMeta() JSON loader.
+  static Future<QuizHeader> fetchQuizHeader({
+    required String quizId,
+    String bucket = 'quizzes',
+  }) async {
+    final meta = await SupabaseService.getQuizIntroMeta(
+      quizId: quizId,
+      bucket: bucket,
+    );
+    return QuizHeader.fromMeta(meta);
+  }
+
+  // Load only the intro metadata from a quiz JSON in Storage.
+  // Returns a normalized map usable by QuizHeader.fromMeta(...)
+  static Future<Map<String, dynamic>> getQuizIntroMeta({
+    required String quizId,
+    String bucket = 'quizzes',
+  }) async {
+    // ---- local helpers (file-name probing) ----
+    String _squash(String s) =>
+        s.toLowerCase().replaceAll(RegExp(r'[^a-z0-9]+'), '');
+    String _hyphenize(String s) => s
+        .toLowerCase()
+        .replaceAll(RegExp(r'[^a-z0-9]+'), '-')
+        .replaceAll(RegExp(r'-+'), '-')
+        .replaceAll(RegExp(r'^-|-$'), '');
+    String _normalizeId(String s) => s
+        .toLowerCase()
+        .replaceAll(RegExp(r'[^a-z0-9]+'), '_')
+        .replaceAll(RegExp(r'_+'), '_')
+        .replaceAll(RegExp(r'^_|_$'), '');
+
+    final norm = _normalizeId(quizId);
+    final hyph = _hyphenize(quizId);
+    final normHyph = _hyphenize(norm);
+
+    final candidates =
+        <String>{
+          '$norm.json',
+          '$hyph.json',
+          '$normHyph.json',
+          'quiz_$norm.json',
+          'quiz-$norm.json',
+          'quiz_$hyph.json',
+          '${norm}_quiz.json',
+          '${hyph}_quiz.json',
+          '${hyph}-quiz.json',
+        }.toList();
+
+    Uint8List? payload;
+
+    // 1) try direct candidates
+    for (final p in candidates) {
+      try {
+        payload = await supa.storage.from(bucket).download(p);
+        break;
+      } catch (_) {
+        /* try next */
+      }
+    }
+
+    // 2) fuzzy fallback
+    if (payload == null) {
+      final entries = await supa.storage.from(bucket).list(path: '');
+      final jsonFiles =
+          entries
+              .where((e) => e.name.toLowerCase().endsWith('.json'))
+              .map((e) => e.name)
+              .toList();
+
+      if (jsonFiles.isEmpty) {
+        throw 'No .json quizzes in bucket root.';
+      }
+
+      final goal = _squash(quizId);
+      String best = '';
+      int bestScore = -1;
+
+      for (final f in jsonFiles) {
+        final s = _squash(f.replaceAll('.json', ''));
+        int score = 0;
+        final n = s.length < goal.length ? s.length : goal.length;
+        for (int k = 1; k <= n; k++) {
+          if (goal.contains(s.substring(0, k))) score = k;
+        }
+        if (s.contains('quiz') && goal.contains('quiz')) score += 3;
+        if (score > bestScore) {
+          bestScore = score;
+          best = f;
+        }
+      }
+
+      payload = await supa.storage.from(bucket).download(best);
+    }
+
+    // --- decode + compute meta
+    final decoded = json.decode(utf8.decode(payload!));
+
+    final metaOut = <String, dynamic>{
+      'quiz_id': quizId,
+      'quiz_title': null,
+      'quiz_description': null,
+      'due_date': null, // DateTime? (we parse if present)
+      'total_points': 0, // int
+      'question_count': 0, // int
+    };
+
+    if (decoded is Map) {
+      final root = Map<String, dynamic>.from(decoded);
+
+      metaOut['quiz_id'] = root['quiz_id'] ?? metaOut['quiz_id'];
+      metaOut['quiz_title'] = root['quiz_title'];
+      metaOut['quiz_description'] = root['quiz_description'];
+
+      final due = root['due_date']?.toString();
+      if (due != null && due.isNotEmpty) {
+        try {
+          metaOut['due_date'] = DateTime.parse(due);
+        } catch (_) {
+          /* ignore parse errors */
+        }
+      }
+
+      if (root['questions'] is List) {
+        final qs =
+            (root['questions'] as List)
+                .whereType<Map>()
+                .map((e) => Map<String, dynamic>.from(e as Map))
+                .toList();
+        metaOut['question_count'] = qs.length;
+
+        int totalPts = 0;
+        for (final q in qs) {
+          final p = (q['points'] is num) ? (q['points'] as num).toInt() : 0;
+          totalPts += p;
+        }
+        metaOut['total_points'] = totalPts;
+      }
+
+      return metaOut;
+    }
+
+    if (decoded is List) {
+      final qs = decoded.whereType<Map>().toList();
+      metaOut['question_count'] = qs.length;
+
+      int totalPts = 0;
+      for (final q in qs) {
+        final p = (q['points'] is num) ? (q['points'] as num).toInt() : 0;
+        totalPts += p;
+      }
+      metaOut['total_points'] = totalPts;
+      return metaOut;
+    }
+
+    return metaOut;
+  }
+
+  /// Prefer the exact quiz_id from the JSON (case preserved). If there's no row,
+  /// optionally fall back to an alternate id (e.g., the route/program id).
+  /// - Case-insensitive matching (ILIKE) so "quiz_ABC" == "QUIZ_abc"
+  /// - Safe numeric coercion for score_pct (numeric → double)
+  /// - Backfills score_pct if null using correct/total
+  static Future<Map<String, dynamic>?> getLatestAttemptForQuiz({
+    required String quizIdExact,
+    String? altIdForFallback,
+  }) async {
+    final uid = supa.auth.currentUser?.id;
+    if (uid == null) return null;
+
+    // Coerce Postgres numeric/json into nice Dart types.
+    Map<String, dynamic> _coerce(Map<String, dynamic> row) {
+      // score_pct may arrive as num, String, or null (though it's STORED)
+      double? pct;
+      final rawPct = row['score_pct'];
+      if (rawPct is num) {
+        pct = rawPct.toDouble();
+      } else if (rawPct is String) {
+        pct = double.tryParse(rawPct);
+      }
+
+      // If score_pct is null for any reason, compute from correct/total
+      if (pct == null) {
+        final c = row['correct'];
+        final t = row['total'];
+        if (c is num && t is num && t > 0) {
+          pct = (c.toDouble() * 100.0) / t.toDouble();
+        }
+      }
+
+      return {
+        'id': row['id'],
+        'user_id': row['user_id'],
+        'quiz_id': row['quiz_id'],
+        'correct': row['correct'],
+        'total': row['total'],
+        'score': row['score'],
+        'score_pct': pct, // ← normalized double or null
+        'duration_sec': row['duration_sec'],
+        'finished_at': row['finished_at'],
+        'is_returned': row['is_returned'] == true,
+        'returned_at': row['returned_at'],
+        'feedback': row['feedback'],
+        'answers': row['answers'],
+        'status': row['status'],
+      };
+    }
+
+    // Single fetch attempt using ILIKE for case-insensitive equality.
+    Future<Map<String, dynamic>?> _fetchIlike(String qid) async {
+      final res =
+          await supa
+              .from('quiz_attempts')
+              .select('''
+            id,
+            user_id,
+            quiz_id,
+            correct,
+            total,
+            score,
+            score_pct,
+            duration_sec,
+            finished_at,
+            is_returned,
+            returned_at,
+            feedback,
+            answers,
+            status
+          ''')
+              .eq('user_id', uid)
+              .ilike('quiz_id', qid) // case-insensitive "equals" when no % used
+              .order('finished_at', ascending: false)
+              .limit(1)
+              .maybeSingle();
+
+      return (res == null) ? null : _coerce(Map<String, dynamic>.from(res));
+    }
+
+    // Try exact id first (case-insensitive)
+    final exact = await _fetchIlike(quizIdExact);
+    if (exact != null) return exact;
+
+    // Optional fallback (also case-insensitive)
+    if (altIdForFallback != null && altIdForFallback.trim().isNotEmpty) {
+      final fallback = await _fetchIlike(altIdForFallback.trim());
+      if (fallback != null) return fallback;
+    }
+
+    // Final tiny normalization attempts (defensive): lower and upper forms.
+    final lower = await _fetchIlike(quizIdExact.toLowerCase());
+    if (lower != null) return lower;
+
+    final upper = await _fetchIlike(quizIdExact.toUpperCase());
+    if (upper != null) return upper;
+
+    return null;
+  }
+
+  // Time helpers used by the intro screen UI.
+  static bool quizIsOpenUtc(DateTime? dueUtc) {
+    if (dueUtc == null) return true;
+    return dueUtc.isAfter(DateTime.now().toUtc());
+  }
+
+  static String formatDueLocal(DateTime? dueUtc) {
+    if (dueUtc == null) return 'No deadline';
+    final local = dueUtc.toLocal();
+    return DateFormat('MMM d, y • h:mm a').format(local);
+  }
+
+  // Prefer the quiz_id from JSON exactly as authored.
+  // If not provided, fall back to a path/URL stem without ".json" (case preserved).
+  static String _resolveQuizId(String inputOrPath, {String? jsonQuizId}) {
+    // 1) If JSON had quiz_id, use it verbatim.
+    if (jsonQuizId != null) {
+      final v = jsonQuizId.trim();
+      if (v.isNotEmpty) return v; // exact characters/casing preserved
+    }
+
+    // 2) Fallback: keep original characters, only strip path/query/fragment and .json
+    final s = inputOrPath.trim();
+    final lastSeg = s.split('/').last; // last path segment
+    final noQuery = lastSeg.split('?').first.split('#').first; // remove ?...
+    final stem = noQuery.replaceAll(
+      RegExp(r'\.json$', caseSensitive: false),
+      '',
+    );
+    return stem; // exact casing preserved
+  }
+
+  // ---------- Review-first attempt saving (no answer key leakage) ----------
+  static Future<void> saveAttemptForReview({
+    required String quizIdOrPath, // can be filename, URL, or id
+    String? quizIdFromJson, // pass j['quiz_id'] here if available
+    required Map<String, dynamic> userAnswers, // question_id -> selection
+    required int durationSec,
+    Map<String, dynamic>? meta,
+  }) async {
+    final uid = supa.auth.currentUser?.id;
+    if (uid == null) return;
+
+    final resolvedId = _resolveQuizId(
+      quizIdOrPath,
+      jsonQuizId: quizIdFromJson, // EXACT JSON id wins
+    );
+
+    await supa.from('quiz_attempts').insert({
+      'quiz_id': resolvedId, // stored exactly as resolved
+      'user_id': uid,
+      'answers': userAnswers, // JSONB
+      'duration_sec': durationSec,
+      'status': 'pending_review',
+      'score': 0, // keep only if schema requires
+      'total': 0,
+      'correct': 0,
+      'meta': {
+        'app': 'mobile',
+        'quiz_id_source':
+            (quizIdFromJson != null && quizIdFromJson.trim().isNotEmpty)
+                ? 'json'
+                : 'path',
+        ...?meta,
+      },
+    });
+  }
+
+  // ---------- Non-adaptive gate to avoid name clash with your adaptive flow ----------
+  static Future<bool> canTakeBankQuiz(String quizId) async {
+    try {
+      final uid = supa.auth.currentUser?.id;
+      if (uid == null) return true;
+
+      final resp =
+          await supa
+              .from('quiz_progress')
+              .select('status')
+              .eq('user_id', uid)
+              .eq('quiz_id', quizId)
+              .limit(1)
+              .maybeSingle();
+
+      final status = (resp?['status'] ?? '').toString().toLowerCase();
+      // Block if completed or locked; otherwise allow
+      return !(status == 'completed' || status == 'locked');
+    } catch (_) {
+      // Fail-open on service error
+      return true;
+    }
   }
 
   // ---------- USERS ----------
@@ -245,8 +774,8 @@ class SupabaseService {
         await supa
             .from('users')
             .select(
-              'first_name,middle_name,last_name,grade_level,school,profile_picture,'
-              'strand,course,track_id,course_id,'
+              'first_name,middle_name,last_name,grade_level,profile_picture,'
+              'strand,course,track_id,course_id,section,' // ⬅️ added section
               'tracks:track_id(track_name),'
               'courses:course_id(name)',
             )
@@ -286,12 +815,12 @@ class SupabaseService {
       'middle_name',
       'last_name',
       'grade_level',
-      'school',
       'profile_picture',
       'strand',
       'course',
       'track_id',
       'course_id',
+      'section', // ⬅️ normalize section too
       'track_label',
       'course_label',
     ]) {
@@ -1296,12 +1825,41 @@ class SupabaseService {
     return supa.storage.from('avatars').getPublicUrl(path);
   }
 
+  /// Back-compat: original screen used a dedicated `my-study-guides` bucket.
+  /// We now keep files in `resources/pdf`. This tries the new location first,
+  /// then falls back to the legacy bucket so old content still works.
   static Future<List<FileObject>> listPdfFiles() async {
+    // NEW preferred location
+    try {
+      final list = await supa.storage.from('resources').list(path: 'pdf');
+      if (list.isNotEmpty) return list;
+    } catch (_) {}
+    // Legacy
     return await supa.storage.from('my-study-guides').list(path: '');
   }
 
   static Future<String?> getPdfUrl(String key) async {
-    return supa.storage.from('my-study-guides').getPublicUrl(key);
+    // If caller passes a bare filename, assume `resources/pdf/<name>`
+    // If caller already passed a path, honor it.
+    final looksLikePath = key.contains('/');
+    final path = looksLikePath ? key : 'pdf/$key';
+
+    // Try signed (works even if you later make bucket private); fall back to public.
+    try {
+      return await supa.storage.from('resources').createSignedUrl(path, 3600);
+    } catch (_) {
+      try {
+        return supa.storage.from('resources').getPublicUrl(path);
+      } catch (_) {
+        // Legacy fallback
+        try {
+          return supa.storage.from('my-study-guides').getPublicUrl(key);
+        } catch (e) {
+          _d('getPdfUrl fallback failed: $e');
+          return null;
+        }
+      }
+    }
   }
 
   static Future<List<FileObject>> listVideoFiles() async {

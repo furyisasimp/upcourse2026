@@ -19,7 +19,10 @@ class Question {
   final String text;
   final List<String> options;
 
-  // NEW: text-entry support
+  // question_id so we can store answers by ID
+  final String? questionId;
+
+  // text-entry support
   final bool isText; // true when question_type == "text"
   final List<String> answerTexts; // accepted answers for text questions
   final bool textAnyCase; // loose/case-insensitive if true
@@ -41,6 +44,7 @@ class Question {
   Question({
     required this.text,
     required this.options,
+    this.questionId,
     this.isText = false,
     this.answerTexts = const <String>[],
     this.textAnyCase = true,
@@ -90,7 +94,7 @@ class Question {
     return Question(
       text: (json['text'] ?? json['question_text'] ?? '').toString(),
       options: isText ? const <String>[] : choices,
-      // NEW:
+      questionId: (json['question_id']?.toString()),
       isText: isText,
       answerTexts: isText ? choices : const <String>[],
       textAnyCase:
@@ -172,14 +176,21 @@ class _QuizScreenState extends State<QuizScreen> {
   final ScrollController _scroll = ScrollController();
 
   bool _loading = true;
-  bool _submitted = false;
+  bool _submitted = false; // results view mode (reveals correctness)
   String? _loadError;
 
   // gating
   bool _blocked = false;
   String? _blockReason;
 
-  // scoring
+  // results/attempt metadata
+  Map<String, dynamic>? _latestAttempt; // raw attempt row
+  DateTime? _submittedAt;
+  DateTime? _returnedAt;
+  bool get _awaitingReview =>
+      _latestAttempt != null && _latestAttempt!['is_returned'] != true;
+
+  // scoring (used when returned)
   int _correct = 0;
   int _total = 0;
   int _scorePct = 0;
@@ -189,18 +200,49 @@ class _QuizScreenState extends State<QuizScreen> {
   int _elapsedSec = 0;
   Timer? _ticker;
 
-  // --- Anti-cheat (plugin is platform-gated)
+  // Anti-cheat (plugin is platform-gated)
   ScreenCaptureEvent? _screenCapture;
   int _cheatStrikes = 0;
   static const int _cheatMax = 3;
   bool _securityBusy = false; // debounce for security snackbars
   bool _leaving = false; // guard against late events while exiting
 
-  // Cached messenger to avoid context lookups in dispose
+  // Cached messenger
   ScaffoldMessengerState? _scaffoldMessenger;
 
   bool get _supportsScreenCapture =>
       !kIsWeb && (Platform.isAndroid || Platform.isIOS || Platform.isMacOS);
+
+  // EXACT quiz_id from the JSON (case preserved)
+  String? _quizIdRawFromJson;
+
+  // Extract quiz_id directly from loaded item maps (case preserved)
+  String? _extractQuizIdFromSelected(List<Map<String, dynamic>> items) {
+    String? pick(Map<String, dynamic> m) {
+      final v = m['quiz_id'] ?? m['quizId'];
+      if (v is String && v.trim().isNotEmpty) return v.trim();
+      final meta = m['meta'];
+      if (meta is Map && meta['quiz_id'] is String) {
+        final s = (meta['quiz_id'] as String).trim();
+        if (s.isNotEmpty) return s;
+      }
+      final header = m['header'];
+      if (header is Map && header['quiz_id'] is String) {
+        final s = (header['quiz_id'] as String).trim();
+        if (s.isNotEmpty) return s;
+      }
+      return null;
+    }
+
+    if (items.isEmpty) return null;
+    // robust: try first, else first non-empty candidate
+    final firstPick = pick(items.first);
+    if (firstPick != null && firstPick.isNotEmpty) return firstPick;
+    final cand = items
+        .map(pick)
+        .firstWhere((s) => s != null && s!.isNotEmpty, orElse: () => null);
+    return cand;
+  }
 
   @override
   void initState() {
@@ -210,7 +252,6 @@ class _QuizScreenState extends State<QuizScreen> {
         _screenCapture = ScreenCaptureEvent();
         _initScreenCapture();
       } catch (e) {
-        // fail-open: proceed without anti-cheat if plugin not available
         debugPrint('screen_capture_event init skipped: $e');
         _screenCapture = null;
       }
@@ -355,11 +396,16 @@ class _QuizScreenState extends State<QuizScreen> {
         _blocked = false;
         _blockReason = null;
         _loadError = null;
+        _latestAttempt = null;
+        _submitted = false;
+        _returnedAt = null;
+        _submittedAt = null;
       });
     }
 
     try {
-      final allowed = await SupabaseService.canTakeQuiz(_programId);
+      // high-level strand gate
+      final allowed = await SupabaseService.canTakeBankQuiz(_programId);
       if (!mounted) return;
       if (!allowed) {
         setState(() {
@@ -382,7 +428,7 @@ class _QuizScreenState extends State<QuizScreen> {
         return;
       }
 
-      // IMPORTANT: ask for ALL questions (no sampling)
+      // Load ALL questions (no sampling)
       final selected = await SupabaseService.fetchQuizWithTOS(
         quizId: _programId,
         bucket: 'quizzes',
@@ -403,6 +449,61 @@ class _QuizScreenState extends State<QuizScreen> {
         ..clear()
         ..addAll(List.generate(_questions.length, (_) => GlobalKey()));
 
+      // Exact quiz_id from JSON (case preserved)
+      _quizIdRawFromJson = _extractQuizIdFromSelected(
+        selected.map((e) => Map<String, dynamic>.from(e)).toList(),
+      );
+
+      // --- Check latest attempt for this exact quiz_id ---
+      final attempt = await SupabaseService.getLatestAttemptForQuiz(
+        quizIdExact: _quizIdRawFromJson ?? _programId,
+        altIdForFallback: _programId, // legacy rows may have used route id
+      );
+      _latestAttempt = attempt;
+
+      if (attempt != null) {
+        // Use columns from your schema
+        final finishedAtStr = '${attempt['finished_at'] ?? ''}';
+        final returnedAtStr = '${attempt['returned_at'] ?? ''}';
+        _submittedAt = DateTime.tryParse(finishedAtStr);
+        _returnedAt = DateTime.tryParse(returnedAtStr);
+
+        // If returned, switch to results view and hydrate answers
+        if (attempt['is_returned'] == true ||
+            '${attempt['status']}'.toLowerCase() == 'returned') {
+          _submitted = true;
+          _correct =
+              (attempt['correct'] is num)
+                  ? (attempt['correct'] as num).toInt()
+                  : _correct;
+          _total =
+              (attempt['total'] is num)
+                  ? (attempt['total'] as num).toInt()
+                  : _questions.length;
+          final sc =
+              (attempt['score'] is num)
+                  ? (attempt['score'] as num).toInt()
+                  : null;
+          _scorePct = sc ?? (_total > 0 ? ((_correct * 100) ~/ _total) : 0);
+
+          // Fill _answers from attempt JSON so the UI can render choices
+          final Map<String, dynamic> ansJson =
+              (attempt['answers'] is Map)
+                  ? Map<String, dynamic>.from(attempt['answers'] as Map)
+                  : <String, dynamic>{};
+          _hydrateAnswersFromAttempt(ansJson);
+        } else {
+          // Awaiting review -> lock answering, show Awaiting screen
+          _blocked = true;
+          final when =
+              _submittedAt != null ? ' on ${_fmtDT(_submittedAt!)}' : '';
+          _blockReason =
+              'This attempt was already submitted$when and is awaiting your teacher’s review.';
+        }
+      }
+      // ----------------------------------------------------
+
+      // start screen timer (only used during answering)
       _ticker?.cancel();
       _elapsedSec = 0;
       _ticker = Timer.periodic(const Duration(seconds: 1), (_) {
@@ -427,7 +528,98 @@ class _QuizScreenState extends State<QuizScreen> {
     }
   }
 
-  // Canonicalization for loose comparison (case/spacing/punctuation-insensitive)
+  // Turn an attempt.answers payload back into this screen's _answers map
+  void _hydrateAnswersFromAttempt(Map<String, dynamic> ansJson) {
+    // Build a lookup: question_id (or 'q_i' fallback) -> index
+    final Map<String, int> idToIndex = {};
+    for (var i = 0; i < _questions.length; i++) {
+      final q = _questions[i];
+      final qid = (q.questionId ?? '').trim();
+      idToIndex[qid.isNotEmpty ? qid : 'q_$i'] = i;
+    }
+
+    for (final entry in ansJson.entries) {
+      final key = entry.key;
+      final val = entry.value;
+      final idx = idToIndex[key];
+      if (idx == null) continue;
+      final q = _questions[idx];
+
+      if (q.isText) {
+        // accepted formats: string, {text: "..."}
+        if (val is String) {
+          _answers[idx] = val;
+        } else if (val is Map && val['text'] is String) {
+          _answers[idx] = val['text'];
+        } else {
+          _answers[idx] = '';
+        }
+        continue;
+      }
+
+      if (q.allowMultiple) {
+        // acceptable val: [indices], ["labels"...], {idx:[...], text:[...]}
+        final Set<int> picked = <int>{};
+
+        if (val is List) {
+          if (val.isNotEmpty && val.first is String) {
+            // list of labels
+            for (final s in val.cast<String>()) {
+              final i = q.options.indexOf(s);
+              if (i >= 0) picked.add(i);
+            }
+          } else {
+            // list of indices
+            for (final n in val) {
+              if (n is num) {
+                final i = n.toInt();
+                if (i >= 0 && i < q.options.length) picked.add(i);
+              }
+            }
+          }
+        } else if (val is Map) {
+          final idxs = val['idx'];
+          final texts = val['text'];
+          if (idxs is List) {
+            for (final n in idxs) {
+              if (n is num) {
+                final i = n.toInt();
+                if (i >= 0 && i < q.options.length) picked.add(i);
+              }
+            }
+          } else if (texts is List) {
+            for (final s in texts.cast<String>()) {
+              final i = q.options.indexOf(s);
+              if (i >= 0) picked.add(i);
+            }
+          }
+        }
+        _answers[idx] = picked;
+      } else {
+        // single-choice acceptable val: index, label, {idx:.., text:..}
+        if (val is num) {
+          final i = val.toInt();
+          if (i >= 0 && i < q.options.length) {
+            _answers[idx] = q.options[i];
+          }
+        } else if (val is String) {
+          // label
+          if (val.isNotEmpty) _answers[idx] = val;
+        } else if (val is Map) {
+          if (val['text'] is String && (val['text'] as String).isNotEmpty) {
+            _answers[idx] = val['text'];
+          } else if (val['idx'] is num) {
+            final i = (val['idx'] as num).toInt();
+            if (i >= 0 && i < q.options.length) {
+              _answers[idx] = q.options[i];
+            }
+          }
+        }
+      }
+    }
+  }
+
+  // Canonicalization for loose comparison
   String _canon(String? s) {
     final t = (s ?? '').trim().toLowerCase();
     final squashed = t.replaceAll(RegExp(r'\s+'), ' ');
@@ -443,6 +635,7 @@ class _QuizScreenState extends State<QuizScreen> {
     return false;
   }
 
+  // ---------- Submit "for review" only (no correctness reveal here) ----------
   Future<void> _submit() async {
     if (_answers.length != _questions.length ||
         !_questions.asMap().keys.every(_isAnswered)) {
@@ -464,113 +657,101 @@ class _QuizScreenState extends State<QuizScreen> {
       return;
     }
 
-    int correct = 0;
-    final Map<int, int> chosenIndexes = {};
-    final Map<int, List<int>> chosenMulti = {};
-
+    // Build answers keyed by question_id (or fallback key)
+    // Save labels "as is" for choices; free-text as typed.
+    final Map<String, dynamic> userAnswers = {};
     for (var i = 0; i < _questions.length; i++) {
       final q = _questions[i];
+      final qid = (q.questionId ?? '').trim();
+      final key = qid.isNotEmpty ? qid : 'q_$i';
+
       final ans = _answers[i];
 
-      // TEXT questions
       if (q.isText) {
-        final given = (ans is String) ? ans : '';
-        if (given.trim().isNotEmpty) {
-          // build a typed pool of accepted answers
-          final List<String> pool =
-              q.answerTexts.isNotEmpty
-                  ? List<String>.from(q.answerTexts)
-                  : (q.correctText != null
-                      ? <String>[q.correctText!]
-                      : const <String>[]);
-
-          final Set<String> allowed =
-              pool
-                  .map<String>((a) => q.textAnyCase ? _canon(a) : a.trim())
-                  .toSet();
-
-          final String test = q.textAnyCase ? _canon(given) : given.trim();
-          if (allowed.contains(test)) correct++;
-        }
-        // Do not record index for text questions (indices are meaningless)
+        userAnswers[key] = (ans is String) ? ans : '';
         continue;
       }
 
       if (q.allowMultiple) {
-        final Set<int> given = (ans is Set<int>) ? ans : <int>{};
-        final Set<int> correctSet = q.correctIndexes.toSet();
-
-        if (given.isNotEmpty) {
-          chosenIndexes[i] = given.first;
-          final list = given.toList()..sort();
-          chosenMulti[i] = list;
+        final selectedIdxs = (ans is Set<int>) ? ans : <int>{};
+        final labels = <String>[];
+        for (var idx = 0; idx < q.options.length; idx++) {
+          if (selectedIdxs.contains(idx)) labels.add(q.options[idx]);
         }
-
-        final isRight =
-            given.isNotEmpty &&
-            given.length == correctSet.length &&
-            given.intersection(correctSet).length == correctSet.length;
-
-        if (isRight) correct++;
+        userAnswers[key] = labels; // e.g., ["A", "C"]
       } else {
-        final selectedText = _canon(ans is String ? ans : '');
-        final selIdx = q.options.indexWhere((o) => _canon(o) == selectedText);
-        if (selIdx >= 0) {
-          chosenIndexes[i] = selIdx;
-          chosenMulti[i] = [selIdx];
-        }
-
-        bool isRight = false;
-        final idx0 = q.correctIndex0();
-        if (idx0 != null) {
-          isRight = selIdx == idx0;
-        } else if (q.correctText != null) {
-          isRight = selectedText == _canon(q.correctText);
-        }
-        if (isRight) correct++;
+        final sel = (ans is String) ? ans.trim() : '';
+        userAnswers[key] = sel.isNotEmpty ? sel : null; // "B"
       }
     }
 
-    final total = _questions.length;
-    final scorePct = ((correct * 100) / (total == 0 ? 1 : total)).round();
     final elapsed = DateTime.now().difference(_startedAt).inSeconds;
 
     try {
-      await SupabaseService.updateQuizProgress(
-        _programId,
-        status: 'completed',
-        score: scorePct,
-        answers: chosenIndexes,
-        answersMulti: chosenMulti,
-      );
-    } catch (_) {}
-
-    try {
-      await SupabaseService.saveQuizAttempt(
-        quizId: _programId,
-        correct: correct,
-        total: total,
+      await SupabaseService.saveAttemptForReview(
+        quizIdOrPath: _programId, // route/program id
+        quizIdFromJson: _quizIdRawFromJson, // EXACT JSON id wins if present
+        userAnswers: userAnswers,
         durationSec: elapsed,
-        meta: {'app': 'mobile', 'source': 'QuizScreen'},
       );
-    } catch (_) {}
+    } catch (e) {
+      if (!mounted) return;
+      _scaffoldMessenger ??= ScaffoldMessenger.maybeOf(context);
+      _scaffoldMessenger?.showSnackBar(
+        SnackBar(
+          behavior: SnackBarBehavior.floating,
+          backgroundColor: Colors.redAccent,
+          content: Text(
+            'Failed to submit for review: $e',
+            style: const TextStyle(fontFamily: 'Inter'),
+          ),
+        ),
+      );
+      return;
+    }
 
     if (!mounted) return;
+
+    // Awaiting-review: freeze UI, keep answers visible, no auto-exit
     setState(() {
-      _submitted = true;
-      _correct = correct;
-      _total = total;
-      _scorePct = scorePct;
-      _elapsedSec = elapsed;
+      _submitted = false; // do not reveal correctness
+      _blocked = true; // disables editing + hides the submit button
+      _submittedAt = DateTime.now();
+      _latestAttempt = {
+        ...?_latestAttempt,
+        'is_returned': false,
+        'status': 'pending_review',
+        'finished_at': _submittedAt!.toIso8601String(),
+      };
+      _blockReason =
+          'Submitted on ${_fmtDT(_submittedAt!)} • Awaiting teacher review.';
     });
 
-    if (!mounted) return;
+    // stop ticking while blocked
+    _ticker?.cancel();
+
+    // toast
     _scaffoldMessenger ??= ScaffoldMessenger.maybeOf(context);
     _scaffoldMessenger?.showSnackBar(
-      SnackBar(
-        content: Text('Score: $correct/$total ($_scorePct%) • ${_elapsedSec}s'),
+      const SnackBar(
+        behavior: SnackBarBehavior.floating,
+        content: Text(
+          'Submitted for review. You’ll see your score once it’s returned.',
+          style: TextStyle(fontFamily: 'Inter'),
+        ),
       ),
     );
+
+    // make the awaiting banner visible
+    if (_scroll.hasClients) {
+      _scroll.animateTo(
+        0,
+        duration: const Duration(milliseconds: 300),
+        curve: Curves.easeOut,
+      );
+    }
+
+    // NOTE: removed the old delay + _returnHome() to prevent auto-exit
   }
 
   void _scrollTo(int index) {
@@ -674,6 +855,11 @@ class _QuizScreenState extends State<QuizScreen> {
     );
   }
 
+  String _fmtDT(DateTime dt) {
+    final two = (int v) => v.toString().padLeft(2, '0');
+    return '${dt.year}-${two(dt.month)}-${two(dt.day)} ${two(dt.hour)}:${two(dt.minute)}';
+  }
+
   @override
   Widget build(BuildContext context) {
     final (colors, icon, titleText) = _meta();
@@ -698,6 +884,9 @@ class _QuizScreenState extends State<QuizScreen> {
             ? 18.0
             : 12.0;
 
+    final awaitingBanner =
+        (_latestAttempt != null && _latestAttempt!['is_returned'] != true);
+
     return PopScope(
       canPop: false,
       onPopInvoked: (didPop) {
@@ -720,7 +909,11 @@ class _QuizScreenState extends State<QuizScreen> {
             ),
           ),
           title: Text(
-            _submitted ? 'Results Overview' : titleText,
+            _submitted
+                ? 'Results Overview'
+                : awaitingBanner
+                ? 'Awaiting Review'
+                : titleText,
             style: const TextStyle(
               fontFamily: 'Poppins',
               color: Colors.white,
@@ -735,8 +928,15 @@ class _QuizScreenState extends State<QuizScreen> {
                     onPressed: _requestExit,
                   ),
         ),
+
+        // Hide submit button when blocked/awaiting or viewing results
         bottomNavigationBar:
-            _loading || _submitted || _questions.isEmpty || _blocked
+            _loading ||
+                    _submitted ||
+                    _questions.isEmpty ||
+                    _blocked ||
+                    (_latestAttempt != null &&
+                        _latestAttempt!['is_returned'] != true)
                 ? null
                 : SafeArea(
                   top: false,
@@ -769,12 +969,21 @@ class _QuizScreenState extends State<QuizScreen> {
                     ),
                   ),
                 ),
+
         body:
             _loading
                 ? const Center(child: CircularProgressIndicator())
                 : _loadError != null
                 ? _ErrorState(message: _loadError!, onRetry: _checkGateAndLoad)
-                : _blocked
+                : _blocked && _awaitingReview
+                ? _AwaitingState(
+                  icon: icon,
+                  colors: colors,
+                  submittedAt: _submittedAt,
+                  onGoHome: _returnHome,
+                  onRequestRetry: _checkGateAndLoad,
+                )
+                : _blocked && !_awaitingReview
                 ? _BlockedState(
                   icon: icon,
                   colors: colors,
@@ -798,7 +1007,8 @@ class _QuizScreenState extends State<QuizScreen> {
                         scorePct: _scorePct,
                         progressValue:
                             _submitted
-                                ? (_scorePct / 100).clamp(0, 1)
+                                ? ((_scorePct / 100.0).clamp(0.0, 1.0)
+                                    as double)
                                 : progress,
                         label:
                             _submitted
@@ -806,7 +1016,9 @@ class _QuizScreenState extends State<QuizScreen> {
                                 : 'Progress',
                         sublabel:
                             _submitted
-                                ? 'Results saved to your progress'
+                                ? (_returnedAt != null
+                                    ? 'Returned on ${_fmtDT(_returnedAt!)}'
+                                    : 'Results saved to your progress')
                                 : '$answered of $total answered',
                         elapsedSec: _elapsedSec,
                       ),
@@ -921,6 +1133,11 @@ class _QuizScreenState extends State<QuizScreen> {
                         itemCount: _questions.length,
                         itemBuilder: (context, index) {
                           final q = _questions[index];
+                          final readOnly =
+                              _submitted ||
+                              (_latestAttempt != null &&
+                                  _latestAttempt!['is_returned'] !=
+                                      true); // awaiting review: view-only
                           return KeyedSubtree(
                             key: _qKeys[index],
                             child: _QuestionCard(
@@ -929,8 +1146,9 @@ class _QuizScreenState extends State<QuizScreen> {
                               selected: _answers[index],
                               submitted: _submitted,
                               accent: colors.last,
+                              submittedAt: _submittedAt, // pass down
                               onChanged: (val) {
-                                if (_submitted) return;
+                                if (readOnly) return;
                                 setState(() => _answers[index] = val);
                               },
                             ),
@@ -952,9 +1170,11 @@ class _QuizScreenState extends State<QuizScreen> {
                               ),
                             ),
                             onPressed: _returnHome,
-                            child: const Text(
-                              'Return Home',
-                              style: TextStyle(
+                            child: Text(
+                              _returnedAt != null
+                                  ? 'Returned on ${_fmtDT(_returnedAt!)} — Home'
+                                  : 'Return Home',
+                              style: const TextStyle(
                                 fontFamily: 'Inter',
                                 fontWeight: FontWeight.w600,
                               ),
@@ -1028,7 +1248,9 @@ class _HeaderCard extends StatelessWidget {
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
                 Text(
-                  '$label  •  ${_fmtTime(elapsedSec)}',
+                  submitted
+                      ? 'Results'
+                      : 'Progress  •  ${_fmtTime(elapsedSec)}',
                   style: const TextStyle(
                     fontFamily: 'Poppins',
                     fontSize: 14,
@@ -1164,6 +1386,7 @@ class _QuestionCard extends StatelessWidget {
   final Color accent;
   final ValueChanged<dynamic>
   onChanged; // String for single/text, Set<int> for multi
+  final DateTime? submittedAt; // timestamp from parent
 
   const _QuestionCard({
     required this.index,
@@ -1172,6 +1395,7 @@ class _QuestionCard extends StatelessWidget {
     required this.submitted,
     required this.accent,
     required this.onChanged,
+    this.submittedAt,
   });
 
   String _canon(String? s) {
@@ -1194,6 +1418,11 @@ class _QuestionCard extends StatelessWidget {
     if (await canLaunchUrl(uri)) {
       await launchUrl(uri, mode: LaunchMode.externalApplication);
     }
+  }
+
+  String _fmtDT(DateTime dt) {
+    final two = (int v) => v.toString().padLeft(2, '0');
+    return '${dt.year}-${two(dt.month)}-${two(dt.day)} ${two(dt.hour)}:${two(dt.minute)}';
   }
 
   @override
@@ -1259,7 +1488,7 @@ class _QuestionCard extends StatelessWidget {
     // ---------- MEDIA (images + pdfs) ----------
     final List<Widget> media = [];
 
-    // Images (contained, not huge; maintain aspect)
+    // Images
     final imgs = question.images
         .map(_urlFrom)
         .whereType<String>()
@@ -1273,7 +1502,7 @@ class _QuestionCard extends StatelessWidget {
             width: double.infinity,
             color: Colors.black12.withOpacity(.04),
             child: FittedBox(
-              fit: BoxFit.contain, // show full image without cropping
+              fit: BoxFit.contain,
               alignment: Alignment.center,
               child: Image.network(
                 url,
@@ -1310,7 +1539,7 @@ class _QuestionCard extends StatelessWidget {
       media.add(const SizedBox(height: 10));
     }
 
-    // PDFs (lazy mount viewers to avoid freezes)
+    // PDFs (lazy)
     final pdfs = question.files
         .where(
           (f) =>
@@ -1439,7 +1668,7 @@ class _QuestionCard extends StatelessWidget {
               ),
               child: RadioListTile<String>(
                 value: opt,
-                groupValue: (selected is String) ? selected as String? : null,
+                groupValue: (selected is String) ? selected as String : null,
                 onChanged: (v) => onChanged(v!),
                 dense: true,
                 activeColor: accent,
@@ -1577,6 +1806,10 @@ class _QuestionCard extends StatelessWidget {
       );
     }
 
+    final awaiting =
+        (submitted == false) &&
+        (submittedAt != null); // card-level banner when awaiting review
+
     return Container(
       margin: const EdgeInsets.symmetric(vertical: 8),
       decoration: BoxDecoration(
@@ -1596,6 +1829,22 @@ class _QuestionCard extends StatelessWidget {
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
+            if (awaiting)
+              Container(
+                width: double.infinity,
+                padding: const EdgeInsets.all(12),
+                margin: const EdgeInsets.only(bottom: 8),
+                decoration: BoxDecoration(
+                  color: Colors.amber.withOpacity(.14),
+                  borderRadius: BorderRadius.circular(10),
+                  border: Border.all(color: Colors.amber.withOpacity(.5)),
+                ),
+                child: Text(
+                  'Submitted${submittedAt != null ? ' on ${_fmtDT(submittedAt!)}' : ''}. '
+                  'Awaiting teacher review. You can view your answers but cannot edit.',
+                  style: const TextStyle(fontFamily: 'Inter'),
+                ),
+              ),
             Row(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
@@ -1631,7 +1880,10 @@ class _QuestionCard extends StatelessWidget {
               ],
             ),
             const SizedBox(height: 10),
-            if (!submitted) _buildUnsubmitted() else _buildSubmitted(),
+            if (!submitted && !awaiting)
+              _buildUnsubmitted()
+            else
+              _buildSubmitted(),
           ],
         ),
       ),
@@ -1662,7 +1914,6 @@ class _PdfInlineState extends State<_PdfInline> {
   Widget build(BuildContext context) {
     return Column(
       children: [
-        // External open is always available (lightweight)
         Align(
           alignment: Alignment.centerRight,
           child: TextButton.icon(
@@ -1671,7 +1922,6 @@ class _PdfInlineState extends State<_PdfInline> {
             label: const Text('Open PDF'),
           ),
         ),
-        // Lazy inline loader to avoid freezes
         OutlinedButton.icon(
           onPressed: () => setState(() => _open = !_open),
           icon: Icon(_open ? Icons.close_fullscreen : Icons.picture_as_pdf),
@@ -1706,6 +1956,90 @@ class _PdfInlineState extends State<_PdfInline> {
                   ),
         ),
       ],
+    );
+  }
+}
+
+class _AwaitingState extends StatelessWidget {
+  final IconData icon;
+  final List<Color> colors;
+  final DateTime? submittedAt;
+  final VoidCallback onGoHome;
+  final Future<void> Function() onRequestRetry;
+
+  const _AwaitingState({
+    required this.icon,
+    required this.colors,
+    required this.submittedAt,
+    required this.onGoHome,
+    required this.onRequestRetry,
+  });
+
+  String _fmtDT(DateTime dt) {
+    final two = (int v) => v.toString().padLeft(2, '0');
+    return '${dt.year}-${two(dt.month)}-${two(dt.day)} ${two(dt.hour)}:${two(dt.minute)}';
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.all(24),
+      child: Column(
+        mainAxisAlignment: MainAxisAlignment.center,
+        children: [
+          Container(
+            padding: const EdgeInsets.all(16),
+            decoration: BoxDecoration(
+              gradient: LinearGradient(colors: colors),
+              borderRadius: BorderRadius.circular(18),
+              boxShadow: [
+                BoxShadow(
+                  color: colors.last.withOpacity(0.35),
+                  blurRadius: 10,
+                  offset: const Offset(0, 6),
+                ),
+              ],
+            ),
+            child: CircleAvatar(
+              radius: 28,
+              backgroundColor: Colors.white,
+              child: Icon(icon, color: colors.last),
+            ),
+          ),
+          const SizedBox(height: 16),
+          const Text(
+            'Awaiting Review',
+            style: TextStyle(
+              fontFamily: 'Poppins',
+              fontWeight: FontWeight.w700,
+              fontSize: 18,
+            ),
+          ),
+          const SizedBox(height: 8),
+          Text(
+            submittedAt != null
+                ? 'Submitted on ${_fmtDT(submittedAt!)}'
+                : 'Submitted — time unavailable',
+            textAlign: TextAlign.center,
+            style: const TextStyle(fontFamily: 'Inter'),
+          ),
+          const SizedBox(height: 16),
+          Row(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              OutlinedButton(
+                onPressed: onGoHome,
+                child: const Text('Return Home'),
+              ),
+              const SizedBox(width: 12),
+              TextButton(
+                onPressed: () => onRequestRetry(),
+                child: const Text('Refresh'),
+              ),
+            ],
+          ),
+        ],
+      ),
     );
   }
 }

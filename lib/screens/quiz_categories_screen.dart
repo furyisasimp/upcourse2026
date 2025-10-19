@@ -41,8 +41,9 @@ class _QuizCategoriesScreenState extends State<QuizCategoriesScreen> {
   List<Map<String, dynamic>> _categories = [];
 
   // Partitioned lists
-  List<Map<String, dynamic>> _available = [];
-  List<Map<String, dynamic>> _completed = [];
+  List<Map<String, dynamic>> _available = []; // no attempt yet + gate allows
+  List<Map<String, dynamic>> _answered =
+      []; // attempt exists (awaiting or returned)
 
   // Hover state keyed by quiz id (web nicety)
   final Map<String, bool> _hovering = {};
@@ -69,13 +70,13 @@ class _QuizCategoriesScreenState extends State<QuizCategoriesScreen> {
       _error = null;
       _categories = [];
       _available = [];
-      _completed = [];
+      _answered = [];
       _hovering.clear();
     });
 
     await _loadCategoriesFromStorage();
     if (mounted && _categories.isNotEmpty) {
-      await _partitionByLockStatus();
+      await _partitionByStatus();
     }
 
     if (mounted) setState(() => _loading = false);
@@ -95,7 +96,7 @@ class _QuizCategoriesScreenState extends State<QuizCategoriesScreen> {
                 : name;
         final noPrefix =
             base.startsWith('quiz_') ? base.substring('quiz_'.length) : base;
-        return noPrefix.toUpperCase(); // ABM, GAS, STEM, TECHPRO
+        return noPrefix.toUpperCase(); // ABM, GAS, STEM, TECHPRO or custom ids
       }
 
       final ids =
@@ -138,31 +139,65 @@ class _QuizCategoriesScreenState extends State<QuizCategoriesScreen> {
     }
   }
 
-  Future<void> _partitionByLockStatus() async {
+  // Decide Available / Awaiting / Returned using both the gate and the latest attempt.
+  Future<void> _partitionByStatus() async {
     setState(() => _checkingLocks = true);
-
     try {
-      final results = await Future.wait(
+      final cards = await Future.wait(
         _categories.map((cat) async {
           final id = cat['id'] as String;
+
+          // Gate (can the student currently take this bank quiz?)
+          bool canTake = true;
           try {
-            final canTake = await SupabaseService.canTakeQuiz(id);
-            return (id: id, canTake: canTake);
+            canTake = await SupabaseService.canTakeBankQuiz(id);
           } catch (_) {
-            return (id: id, canTake: true); // fail-open
+            canTake = true; // fail-open on errors
           }
-        }).toList(),
+
+          // Latest attempt (case-insensitive by your updated service)
+          Map<String, dynamic>? latest;
+          try {
+            latest = await SupabaseService.getLatestAttemptForQuiz(
+              quizIdExact: id,
+              altIdForFallback: id,
+            );
+          } catch (_) {
+            latest = null;
+          }
+
+          final hasAttempt = latest != null;
+          final isReturned = latest?['is_returned'] == true;
+
+          _QuizStatus status;
+          if (!hasAttempt && canTake) {
+            status = _QuizStatus.available;
+          } else if (hasAttempt && !isReturned) {
+            status = _QuizStatus.awaiting;
+          } else {
+            status = _QuizStatus.returned;
+          }
+
+          return _CardModel(
+            id: id,
+            title: cat['title'] as String,
+            icon: cat['icon'] as IconData,
+            color: cat['color'] as Color,
+            status: status,
+          ).toMap();
+        }),
       );
 
-      final byId = {for (final r in results) r.id: r.canTake};
-
       _available = [];
-      _completed = [];
-      for (final cat in _categories) {
-        final id = cat['id'] as String;
-        final canTake = byId[id] ?? true;
-        (canTake ? _available : _completed).add(cat);
-        _hovering[id] = false;
+      _answered = [];
+      for (final m in cards) {
+        final status = m['status'] as String;
+        if (status == _QuizStatus.available.name) {
+          _available.add(m);
+        } else {
+          _answered.add(m);
+        }
+        _hovering[m['id'] as String] = false;
       }
     } finally {
       if (mounted) setState(() => _checkingLocks = false);
@@ -228,11 +263,11 @@ class _QuizCategoriesScreenState extends State<QuizCategoriesScreen> {
       case _Filter.available:
         src = _available;
         break;
-      case _Filter.completed:
-        src = _completed;
+      case _Filter.completed: // maps to answered (awaiting + returned)
+        src = _answered;
         break;
       default:
-        src = [..._available, ..._completed];
+        src = [..._available, ..._answered];
     }
     final q = _query.trim().toLowerCase();
     if (q.isEmpty) return src;
@@ -275,7 +310,7 @@ class _QuizCategoriesScreenState extends State<QuizCategoriesScreen> {
       body:
           busy
               ? const Center(child: CircularProgressIndicator())
-              : (_available.isEmpty && _completed.isEmpty)
+              : (_available.isEmpty && _answered.isEmpty)
               ? _EmptyState(onRetry: _refreshAll, error: _error)
               : RefreshIndicator(
                 onRefresh: _refreshAll,
@@ -286,9 +321,9 @@ class _QuizCategoriesScreenState extends State<QuizCategoriesScreen> {
                     _SearchAndFilterBar(
                       initialQuery: _query,
                       counts: (
-                        all: _available.length + _completed.length,
+                        all: _available.length + _answered.length,
                         available: _available.length,
-                        completed: _completed.length,
+                        completed: _answered.length,
                       ),
                       onQueryChanged: (q) => setState(() => _query = q),
                       selected: _filter,
@@ -313,11 +348,11 @@ class _QuizCategoriesScreenState extends State<QuizCategoriesScreen> {
                       cols: cols,
                       aspect: aspect,
                       available: _available,
-                      completed: _completed,
+                      completed: _answered,
                       hovering: _hovering,
                       query: _query,
                       filter: _filter,
-                      onTapAvailable: _navigateToIntro,
+                      onTapAny: _navigateToIntro, // always go to Intro
                     ),
                   ],
                 ),
@@ -331,6 +366,8 @@ class _QuizCategoriesScreenState extends State<QuizCategoriesScreen> {
 }
 
 enum _Filter { all, available, completed }
+
+// ---------- Search & filter UI ----------
 
 class _SearchAndFilterBar extends StatelessWidget {
   final String initialQuery;
@@ -390,7 +427,7 @@ class _SearchAndFilterBar extends StatelessWidget {
           onTap: () => onFilterChanged(_Filter.available),
         ),
         _FilterChip(
-          label: 'Completed (${counts.completed})',
+          label: 'Answered (${counts.completed})',
           selected: selected == _Filter.completed,
           onTap: () => onFilterChanged(_Filter.completed),
         ),
@@ -490,15 +527,19 @@ class _ResultsBanner extends StatelessWidget {
   }
 }
 
+// ---------- Grid & cards ----------
+
+enum _QuizStatus { available, awaiting, returned }
+
 class _ResponsiveGrid extends StatelessWidget {
   final int cols;
   final double aspect;
   final List<Map<String, dynamic>> available;
-  final List<Map<String, dynamic>> completed;
+  final List<Map<String, dynamic>> completed; // awaiting + returned
   final Map<String, bool> hovering;
   final String query;
   final _Filter filter;
-  final void Function(String id) onTapAvailable;
+  final void Function(String id) onTapAny;
 
   const _ResponsiveGrid({
     required this.cols,
@@ -508,16 +549,20 @@ class _ResponsiveGrid extends StatelessWidget {
     required this.hovering,
     required this.query,
     required this.filter,
-    required this.onTapAvailable,
+    required this.onTapAny,
   });
 
   List<_CardModel> _filtered() {
-    List<_CardModel> src = [];
-    if (filter == _Filter.available || filter == _Filter.all) {
-      src.addAll(available.map((m) => _CardModel.from(m, locked: false)));
-    }
-    if (filter == _Filter.completed || filter == _Filter.all) {
-      src.addAll(completed.map((m) => _CardModel.from(m, locked: true)));
+    // merge and then filter by tab
+    List<_CardModel> src = [
+      ...available.map(_CardModel.fromMap),
+      ...completed.map(_CardModel.fromMap),
+    ];
+
+    if (filter == _Filter.available) {
+      src = src.where((m) => m.status == _QuizStatus.available).toList();
+    } else if (filter == _Filter.completed) {
+      src = src.where((m) => m.status != _QuizStatus.available).toList();
     }
 
     final q = query.trim().toLowerCase();
@@ -564,20 +609,31 @@ class _ResponsiveGrid extends StatelessWidget {
         final m = items[i];
         final isHovered = kIsWeb ? (hovering[m.id] ?? false) : false;
 
+        final locked = m.status != _QuizStatus.available;
         final gradient = LinearGradient(
           colors:
-              m.locked
+              locked
                   ? [Colors.grey.shade300, Colors.grey.shade200]
                   : [m.color.withOpacity(0.30), m.color.withOpacity(0.45)],
           begin: Alignment.topLeft,
           end: Alignment.bottomRight,
         );
 
+        String chipText;
+        IconData chipIcon;
+        if (m.status == _QuizStatus.available) {
+          chipText = 'Tap to start';
+          chipIcon = Icons.play_arrow_rounded;
+        } else if (m.status == _QuizStatus.awaiting) {
+          chipText = 'Awaiting review · Tap to view';
+          chipIcon = Icons.hourglass_bottom_rounded;
+        } else {
+          chipText = 'Returned · Tap to view';
+          chipIcon = Icons.visibility_rounded;
+        }
+
         return MouseRegion(
-          cursor:
-              m.locked
-                  ? SystemMouseCursors.forbidden
-                  : SystemMouseCursors.click,
+          cursor: SystemMouseCursors.click, // allow click for both states
           onEnter: (_) {
             if (!kIsWeb) return;
             hovering[m.id] = true;
@@ -589,25 +645,15 @@ class _ResponsiveGrid extends StatelessWidget {
             (ctx as Element).markNeedsBuild();
           },
           child: AnimatedScale(
-            scale: isHovered && !m.locked ? 1.03 : 1.0,
+            scale: isHovered && !locked ? 1.03 : 1.0,
             duration: const Duration(milliseconds: 140),
             child: Material(
               color: Colors.transparent,
               borderRadius: BorderRadius.circular(20),
               child: InkWell(
                 borderRadius: BorderRadius.circular(20),
-                splashColor:
-                    m.locked ? Colors.transparent : m.color.withOpacity(0.25),
-                onTap:
-                    m.locked
-                        ? () {
-                          ScaffoldMessenger.of(ctx).showSnackBar(
-                            const SnackBar(
-                              content: Text('This quiz is already completed.'),
-                            ),
-                          );
-                        }
-                        : () => onTapAvailable(m.id),
+                splashColor: m.color.withOpacity(0.25),
+                onTap: () => onTapAny(m.id), // Intro decides start vs view
                 child: Stack(
                   children: [
                     AnimatedContainer(
@@ -617,7 +663,7 @@ class _ResponsiveGrid extends StatelessWidget {
                         borderRadius: BorderRadius.circular(20),
                         boxShadow: [
                           BoxShadow(
-                            color: (m.locked ? Colors.black26 : m.color)
+                            color: (locked ? Colors.black26 : m.color)
                                 .withOpacity(isHovered ? 0.35 : 0.25),
                             blurRadius: isHovered ? 12 : 8,
                             offset: const Offset(0, 6),
@@ -625,7 +671,7 @@ class _ResponsiveGrid extends StatelessWidget {
                         ],
                         border: Border.all(
                           color:
-                              m.locked
+                              locked
                                   ? Colors.grey.shade400
                                   : Colors.transparent,
                         ),
@@ -636,7 +682,7 @@ class _ResponsiveGrid extends StatelessWidget {
                         children: [
                           CircleAvatar(
                             backgroundColor:
-                                m.locked
+                                locked
                                     ? Colors.grey
                                     : m.color.withOpacity(0.95),
                             radius: 28,
@@ -653,17 +699,18 @@ class _ResponsiveGrid extends StatelessWidget {
                               fontSize: 14.5,
                               fontWeight: FontWeight.w700,
                               color: Colors.black87.withOpacity(
-                                m.locked ? 0.65 : 1,
+                                locked ? 0.65 : 1,
                               ),
                             ),
                           ),
                           const SizedBox(height: 8),
-                          _StatusChip(locked: m.locked),
+                          _StatusChip(text: chipText, icon: chipIcon),
                         ],
                       ),
                     ),
 
-                    if (m.locked)
+                    // Corner badge for awaiting/returned
+                    if (m.status != _QuizStatus.available)
                       Positioned(
                         top: 10,
                         right: 10,
@@ -676,13 +723,22 @@ class _ResponsiveGrid extends StatelessWidget {
                             color: Colors.black.withOpacity(0.55),
                             borderRadius: BorderRadius.circular(10),
                           ),
-                          child: const Row(
+                          child: Row(
                             children: [
-                              Icon(Icons.lock, size: 14, color: Colors.white),
-                              SizedBox(width: 4),
+                              Icon(
+                                m.status == _QuizStatus.returned
+                                    ? Icons.check_circle_rounded
+                                    : Icons.hourglass_bottom_rounded,
+                                size: 14,
+                                color: Colors.white,
+                              ),
+                              const SizedBox(width: 4),
                               Text(
-                                'Completed',
-                                style: TextStyle(
+                                // 🔹 Updated labels per your request
+                                m.status == _QuizStatus.returned
+                                    ? 'Returned'
+                                    : 'To be reviewed',
+                                style: const TextStyle(
                                   fontFamily: 'Inter',
                                   fontSize: 11,
                                   color: Colors.white,
@@ -705,33 +761,30 @@ class _ResponsiveGrid extends StatelessWidget {
 }
 
 class _StatusChip extends StatelessWidget {
-  final bool locked;
-  const _StatusChip({required this.locked});
+  final String text;
+  final IconData icon;
+  const _StatusChip({required this.text, required this.icon});
 
   @override
   Widget build(BuildContext context) {
-    final bg = locked ? Colors.white : Colors.white;
-    final fg = locked ? Colors.black54 : Colors.black87;
-    final icon = locked ? Icons.check_circle : Icons.play_arrow_rounded;
-
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
       decoration: BoxDecoration(
-        color: bg,
+        color: Colors.white,
         borderRadius: BorderRadius.circular(999),
         border: Border.all(color: Colors.black12),
       ),
       child: Row(
         mainAxisSize: MainAxisSize.min,
         children: [
-          Icon(icon, size: 16, color: fg),
+          Icon(icon, size: 16, color: Colors.black87),
           const SizedBox(width: 6),
           Text(
-            locked ? 'Completed' : 'Tap to Start',
-            style: TextStyle(
+            text,
+            style: const TextStyle(
               fontFamily: 'Inter',
               fontSize: 12,
-              color: fg,
+              color: Colors.black87,
               fontWeight: FontWeight.w600,
             ),
           ),
@@ -741,29 +794,49 @@ class _StatusChip extends StatelessWidget {
   }
 }
 
+// ---------- Models & empty ----------
+
 class _CardModel {
   final String id;
   final String title;
   final IconData icon;
   final Color color;
-  final bool locked;
+  final _QuizStatus status;
 
   _CardModel({
     required this.id,
     required this.title,
     required this.icon,
     required this.color,
-    required this.locked,
+    required this.status,
   });
 
-  factory _CardModel.from(Map<String, dynamic> m, {required bool locked}) =>
-      _CardModel(
-        id: m['id'] as String,
-        title: m['title'] as String,
-        icon: m['icon'] as IconData,
-        color: m['color'] as Color,
-        locked: locked,
-      );
+  Map<String, dynamic> toMap() => {
+    'id': id,
+    'title': title,
+    'icon': icon,
+    'color': color,
+    'status': status.name,
+  };
+
+  static _CardModel fromMap(Map<String, dynamic> m) {
+    final s = m['status'];
+    final status =
+        s is String
+            ? (s == 'awaiting'
+                ? _QuizStatus.awaiting
+                : s == 'returned'
+                ? _QuizStatus.returned
+                : _QuizStatus.available)
+            : _QuizStatus.available;
+    return _CardModel(
+      id: m['id'] as String,
+      title: m['title'] as String,
+      icon: m['icon'] as IconData,
+      color: m['color'] as Color,
+      status: status,
+    );
+  }
 }
 
 class _EmptyState extends StatelessWidget {
