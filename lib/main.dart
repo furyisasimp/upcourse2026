@@ -1,5 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
+import 'package:flutter_dotenv/flutter_dotenv.dart'; // Added: For loading the .env file securely
+import 'dart:io'; // Added: For debugging the current directory
 
 import 'routes/route_tracker.dart';
 import 'screens/welcome_screen.dart';
@@ -17,6 +19,13 @@ Future<void> main() async {
     anonKey:
         'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImF5YmdrYnR3a2F2dGx1emVtbHN0Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTQ5MDk0MjUsImV4cCI6MjA3MDQ4NTQyNX0.E1u5XzF173BQmPZ6U4aNdWz2Rk04TPA6X25Ffu9w8MM',
   );
+
+  print(
+    'Current directory: ${Directory.current.path}',
+  ); // Added: Debug to see where Flutter is looking for .env
+  // await dotenv.load(
+  //   fileName: 'lib/.env',
+  // ); // Changed: Load from lib/ folder (move .env there if needed)
 
   runApp(const CareerRoadmapApp());
 }

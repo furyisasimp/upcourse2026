@@ -3,6 +3,7 @@ import 'package:flutter/material.dart';
 import 'quiz_intro_screen.dart';
 import '../widgets/custom_taskbar.dart';
 import 'package:career_roadmap/services/supabase_service.dart';
+import 'package:supabase_flutter/supabase_flutter.dart'; // NEW
 
 class QuizCategoriesScreen extends StatefulWidget {
   const QuizCategoriesScreen({Key? key}) : super(key: key);

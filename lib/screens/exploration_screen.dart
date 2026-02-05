@@ -1,6 +1,7 @@
 // lib/screens/exploration_screen.dart
 import 'package:flutter/material.dart';
 import 'package:url_launcher/url_launcher.dart';
+import 'package:fl_chart/fl_chart.dart'; // For rendering bar charts
 
 import 'home_screen.dart';
 import 'quiz_categories_screen.dart';
@@ -8,6 +9,7 @@ import 'profile_details_screen.dart';
 import '../widgets/custom_taskbar.dart';
 import '../services/supabase_service.dart';
 import '../models/exploration_models.dart'; // Track / Pathway / SourceLink
+import '../services/labor_insights_service.dart'; // Add this to use the labor insights service
 
 // ===== THEME =====
 const kPrimaryBlue = Color(0xFF3EB6FF);
@@ -242,13 +244,52 @@ class _ExplorationScreenState extends State<ExplorationScreen> {
                     'Labor Market & Salary Links',
                     'Check latest official stats',
                   ),
-                  _marketInsights(
-                    onDole: () => _openUrl('https://ble.dole.gov.ph/'),
-                    onPsa:
-                        () => _openUrl(
-                          'https://psa.gov.ph/statistics/survey/labor-and-employment',
-                        ),
-                    onPhilJobNet: () => _openUrl('https://philjobnet.gov.ph/'),
+                  FutureBuilder<Map<String, dynamic>>(
+                    future: LaborInsightsService.getLaborInsights(),
+                    builder: (context, snapshot) {
+                      if (snapshot.connectionState == ConnectionState.waiting) {
+                        return _marketInsights(
+                          insights:
+                              'Loading credible insights from official PSA and DOLE data...',
+                          chartData: {},
+                          onDole: () => _openUrl('https://ble.dole.gov.ph/'),
+                          onPsa:
+                              () => _openUrl(
+                                'https://psa.gov.ph/statistics/survey/labor-and-employment',
+                              ),
+                          onPhilJobNet:
+                              () => _openUrl('https://philjobnet.gov.ph/'),
+                        );
+                      } else if (snapshot.hasError) {
+                        return _marketInsights(
+                          insights:
+                              'Credible data unavailable. Insights are based only on official sources—please check the links below for the latest information.',
+                          chartData: {},
+                          onDole: () => _openUrl('https://ble.dole.gov.ph/'),
+                          onPsa:
+                              () => _openUrl(
+                                'https://psa.gov.ph/statistics/survey/labor-and-employment',
+                              ),
+                          onPhilJobNet:
+                              () => _openUrl('https://philjobnet.gov.ph/'),
+                        );
+                      } else {
+                        final data =
+                            snapshot.data ??
+                            {'summary': 'No data available.', 'chart': {}};
+                        return _marketInsights(
+                          insights: data['summary'],
+                          chartData: data['chart'],
+                          onDole: () => _openUrl('https://ble.dole.gov.ph/'),
+                          onPsa:
+                              () => _openUrl(
+                                'https://psa.gov.ph/statistics/survey/labor-and-employment',
+                              ),
+                          onPhilJobNet:
+                              () => _openUrl('https://philjobnet.gov.ph/'),
+                        );
+                      }
+                    },
                   ),
 
                   const SizedBox(height: 20),
@@ -603,6 +644,8 @@ class _ExplorationScreenState extends State<ExplorationScreen> {
   }
 
   Widget _marketInsights({
+    required String insights,
+    required Map<String, dynamic> chartData,
     required VoidCallback onDole,
     required VoidCallback onPsa,
     required VoidCallback onPhilJobNet,
@@ -623,21 +666,94 @@ class _ExplorationScreenState extends State<ExplorationScreen> {
             children: const [
               Icon(Icons.insights_rounded, color: Colors.green),
               SizedBox(width: 8),
-              Text(
-                'Official sources for latest trends',
-                style: TextStyle(
-                  fontFamily: 'Poppins',
-                  fontWeight: FontWeight.w700,
+              Expanded(
+                child: Text(
+                  'AI-Powered Labor Insights (Official Data Only)',
+                  style: TextStyle(
+                    fontFamily: 'Poppins',
+                    fontWeight: FontWeight.w700,
+                  ),
                 ),
               ),
             ],
           ),
           const SizedBox(height: 12),
-          _trendBar(label: 'Digital jobs demand', value: 0.82),
-          const SizedBox(height: 6),
-          _trendBar(label: 'Entry-level opportunities', value: 0.64),
-          const SizedBox(height: 6),
-          _trendBar(label: 'STEM pathway relevance', value: 0.76),
+          Text(
+            insights,
+            style: const TextStyle(
+              fontFamily: 'Inter',
+              fontSize: 14,
+              color: kTextSecondary,
+            ),
+          ),
+          const SizedBox(height: 12),
+          if (chartData.isNotEmpty) ...[
+            const Text(
+              'Job Field Growth (%) - Based on Official Data',
+              style: TextStyle(
+                fontFamily: 'Inter',
+                fontWeight: FontWeight.w600,
+              ),
+            ),
+            SizedBox(
+              height: 200,
+              child: BarChart(
+                BarChartData(
+                  barGroups:
+                      chartData.entries
+                          .map(
+                            (e) => BarChartGroupData(
+                              x: chartData.keys.toList().indexOf(e.key),
+                              barRods: [
+                                BarChartRodData(
+                                  toY: (e.value as num).toDouble(),
+                                  color:
+                                      (e.value as num) > 0
+                                          ? Colors.green
+                                          : Colors.red,
+                                ),
+                              ],
+                            ),
+                          )
+                          .toList(),
+                  titlesData: FlTitlesData(
+                    bottomTitles: AxisTitles(
+                      sideTitles: SideTitles(
+                        showTitles: true,
+                        getTitlesWidget:
+                            (value, meta) => Text(
+                              chartData.keys.elementAt(value.toInt()),
+                              style: const TextStyle(fontSize: 10),
+                            ),
+                      ),
+                    ),
+                    leftTitles: AxisTitles(
+                      sideTitles: SideTitles(
+                        showTitles: true,
+                        reservedSize: 40,
+                        getTitlesWidget:
+                            (value, meta) => Text(
+                              '${value.toInt()}%',
+                              style: const TextStyle(fontSize: 10),
+                            ),
+                      ),
+                    ),
+                  ),
+                  borderData: FlBorderData(show: true),
+                  gridData: FlGridData(show: true),
+                ),
+              ),
+            ),
+          ] else ...[
+            const Text(
+              'Chart unavailable due to insufficient credible data.',
+              style: TextStyle(
+                fontFamily: 'Inter',
+                fontSize: 12,
+                color: kTextSecondary,
+              ),
+            ),
+          ],
           const SizedBox(height: 14),
           Wrap(
             spacing: 8,

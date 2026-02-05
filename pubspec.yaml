@@ -1,6 +1,6 @@
 name: career_roadmap
 description: "Career Roadmap."
-publish_to: 'none'
+publish_to: "none"
 
 version: 1.0.0+1
 
@@ -10,21 +10,23 @@ environment:
 dependencies:
   flutter:
     sdk: flutter
-  image_picker: ^0.8.4
-  http: ^1.0.0  # For API calls
+  image_picker: ^1.2.0
+  http: ^1.0.0 # For API calls
+  google_generative_ai: ^0.4.0
+  flutter_dotenv: ^5.1.0
   crypto: ^3.0.3 # For password hashing
   percent_indicator: ^4.2.2
-  fl_chart: ^0.66.0
+  fl_chart: ^0.66.2
   video_player: ^2.7.0
   webview_flutter: ^4.2.1
   path_provider: ^2.0.11
   flutter_pdfview: ^1.2.3
   supabase_flutter: ^2.0.0
-  flutter_markdown: ^0.6.18
+  flutter_markdown: ^0.7.7+1
   flutter_math_fork: ^0.7.2
-  url_launcher: ^6.3.0 
+  url_launcher: ^6.3.0
   pdfx: ^2.6.0
-  syncfusion_flutter_pdfviewer: ^25.2.4
+  syncfusion_flutter_pdfviewer: ^31.1.19
   screen_capture_event: ^1.2.0
 
 dev_dependencies:
@@ -33,13 +35,14 @@ dev_dependencies:
   flutter_lints: ^5.0.0
   integration_test:
     sdk: flutter
-  flutter_launcher_icons: ^0.13.1   # ← added
+  flutter_launcher_icons: ^0.14.4 # ← added
 
 flutter:
   uses-material-design: true
 
   assets:
     - assets/
+    - assets/labor_data.json
 
   fonts:
     - family: Poppins
