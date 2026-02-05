@@ -105,7 +105,7 @@ class LaborInsightsService {
     - DOLE Data: ${data['dole']}
     Provide:
     1. A concise, fact-based summary (under 150 words) of trends, unemployment, job demand, salaries, and 2-3 evidence-based tips for students. Base everything on the data provided.
-    2. JSON object with 4-6 distinct job fields or sectors and their growth percentages based strictly on the data (e.g., {"Services": 2.1, "Information Technology": -30, "Retail": 0, "Manufacturing": 0, "Agriculture": 0, "Construction": 0}). Use real figures from the data where available; for sectors not mentioned, set to 0. Ensure fields are clearly named and distinguishable (e.g., avoid vague terms like "IT Skills Mismatch"; instead use "Information Technology" with the mismatch as negative growth).
+    2. JSON object with 4-6 distinct job fields or sectors and their growth percentages based strictly on the data (e.g., {"Services": 2.1, "IT": -30, "Retail": 0, "Manufacturing": 0, "Agriculture": 0, "Construction": 0}). Use real figures from the data where available; for sectors not mentioned, set to 0. Ensure fields are clearly named with short, abbreviated names (e.g., "IT" for Information Technology, "Agri" for Agriculture) to prevent overlapping in mobile app chart displays. Use negative growth for mismatches or declines.
     Format strictly as: {"summary": "text here", "chart": {"field1": percent, ...}}
     If data is insufficient for credible insights, return {"summary": "Insufficient data for credible insights.", "chart": {}}
     ''';
