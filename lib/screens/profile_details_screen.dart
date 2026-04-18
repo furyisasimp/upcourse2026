@@ -183,22 +183,9 @@ class ProfileDetailsScreenState extends State<ProfileDetailsScreen> {
     final String firstName = (_profileData?['first_name'] ?? '').toString();
     final String middleName = (_profileData?['middle_name'] ?? '').toString();
     final String lastName = (_profileData?['last_name'] ?? '').toString();
-    final String gradeLevel =
-        (_profileData?['grade_level'] ?? '').toString().trim();
     final String email = (SupabaseService.authEmail ?? 'N/A').toString();
 
-    // NEW: Section
-    final String section = (_profileData?['section'] ?? '').toString().trim();
-
-    // NEW: Track & Course (from normalized service fields)
-    final String track =
-        (_profileData?['track_label'] ??
-                _profileData?['track_id'] ??
-                _profileData?['strand'] ??
-                '')
-            .toString()
-            .trim();
-
+    // NEW: Course (from normalized service fields)
     final String course =
         (_profileData?['course_label'] ??
                 _profileData?['course'] ??
@@ -255,19 +242,11 @@ class ProfileDetailsScreenState extends State<ProfileDetailsScreen> {
                       const SizedBox(height: 12),
                       _NameAndRole(
                         name: fullName.isEmpty ? 'Student' : fullName,
-                        role:
-                            gradeLevel.isNotEmpty
-                                ? 'Grade $gradeLevel Student'
-                                : 'Student',
+                        role: 'Student',
                         centered: true,
                       ),
                       const SizedBox(height: 12),
-                      _ChipsRow(
-                        gradeLevel: gradeLevel,
-                        track: track,
-                        course: course,
-                        section: section,
-                      ),
+                      _CourseChip(course: course),
                     ],
                   )
                   : Row(
@@ -285,18 +264,10 @@ class ProfileDetailsScreenState extends State<ProfileDetailsScreen> {
                           children: [
                             _NameAndRole(
                               name: fullName.isEmpty ? 'Student' : fullName,
-                              role:
-                                  gradeLevel.isNotEmpty
-                                      ? 'Grade $gradeLevel Student'
-                                      : 'Student',
+                              role: 'Student',
                             ),
                             const SizedBox(height: 12),
-                            _ChipsRow(
-                              gradeLevel: gradeLevel,
-                              track: track,
-                              course: course,
-                              section: section,
-                            ),
+                            _CourseChip(course: course),
                           ],
                         ),
                       ),
@@ -315,19 +286,13 @@ class ProfileDetailsScreenState extends State<ProfileDetailsScreen> {
             _infoRow('Middle Name', middleName.ifEmpty('—')),
             _infoRow('Last Name', lastName.ifEmpty('—')),
             _infoRow('Full Name', fullName.ifEmpty('—')),
-            _infoRow(
-              'Grade Level',
-              gradeLevel.isNotEmpty ? 'Grade $gradeLevel' : '—',
-            ),
-            _infoRow('Section', section.ifEmpty('—')),
             _infoRow('Email', email.ifEmpty('—')),
 
             const SizedBox(height: 6),
             const Divider(height: 1),
             const SizedBox(height: 6),
 
-            // Track & Course lines
-            _infoRow('Track', track.ifEmpty('—')),
+            // Course line
             _infoRow('Course', course.ifEmpty('—')),
           ],
         ),
@@ -701,39 +666,15 @@ class _NameAndRole extends StatelessWidget {
   }
 }
 
-class _ChipsRow extends StatelessWidget {
-  final String gradeLevel;
+class _CourseChip extends StatelessWidget {
+  final String course;
 
-  // show track & course chips if present
-  final String? track;
-  final String? course;
-
-  // section chip
-  final String? section;
-
-  const _ChipsRow({
-    required this.gradeLevel,
-    this.track,
-    this.course,
-    this.section,
-  });
+  const _CourseChip({required this.course});
 
   @override
   Widget build(BuildContext context) {
-    final chips = <Widget>[
-      if (gradeLevel.isNotEmpty) _chip('Grade $gradeLevel'),
-      if ((section ?? '').trim().isNotEmpty)
-        _chip('Section: ${section!.trim()}'),
-      if ((track ?? '').trim().isNotEmpty) _chip('Track: ${track!.trim()}'),
-      if ((course ?? '').trim().isNotEmpty) _chip(course!.trim()),
-    ];
+    if (course.isEmpty) return const SizedBox.shrink();
 
-    if (chips.isEmpty) return const SizedBox.shrink();
-
-    return Wrap(spacing: 8, runSpacing: 8, children: chips);
-  }
-
-  Widget _chip(String text) {
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
       decoration: BoxDecoration(
@@ -742,7 +683,7 @@ class _ChipsRow extends StatelessWidget {
         border: Border.all(color: Colors.blue.shade100),
       ),
       child: Text(
-        text,
+        course,
         maxLines: 2,
         softWrap: true,
         overflow: TextOverflow.ellipsis,

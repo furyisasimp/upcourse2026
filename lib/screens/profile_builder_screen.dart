@@ -2,6 +2,9 @@ import 'package:flutter/material.dart';
 import 'package:image_picker/image_picker.dart';
 import 'dart:io';
 import 'dart:typed_data';
+import 'package:flutter_typeahead/flutter_typeahead.dart';
+import 'package:http/http.dart' as http;
+import 'dart:convert';
 
 import '../services/supabase_service.dart';
 import 'home_screen.dart';
@@ -25,19 +28,18 @@ class ProfileBuilderScreenState extends State<ProfileBuilderScreen> {
   final TextEditingController _lastNameController = TextEditingController();
   final TextEditingController _suffixController = TextEditingController();
 
-  // We’ll keep this controller to remain compatible with your payload,
-  // but the UI will be a dropdown. We keep it in sync with the selection.
   final TextEditingController _genderController = TextEditingController();
-
   final TextEditingController _usernameController = TextEditingController();
   final TextEditingController _streetController = TextEditingController();
   final TextEditingController _brgyController = TextEditingController();
-  final TextEditingController _cityController = TextEditingController();
-  final TextEditingController _provinceController = TextEditingController();
-  final TextEditingController _gradeLevelController = TextEditingController();
-  final TextEditingController _sectionController = TextEditingController();
-  final TextEditingController _highSchoolLevelController =
-      TextEditingController();
+  final TextEditingController _cityController = TextEditingController(
+    text: 'Baliwag',
+  ); // Pre-filled
+  final TextEditingController _provinceController = TextEditingController(
+    text: 'Bulacan',
+  ); // Pre-filled
+
+  // Removed: _gradeLevelController, _sectionController, _highSchoolLevelController
 
   // Gender dropdown state
   String? _genderValue;
@@ -62,7 +64,7 @@ class ProfileBuilderScreenState extends State<ProfileBuilderScreen> {
   @override
   void initState() {
     super.initState();
-    _gradeLevelController.addListener(_updateHighSchoolLevel);
+    // Removed: _gradeLevelController.addListener(_updateHighSchoolLevel);
   }
 
   @override
@@ -78,29 +80,11 @@ class ProfileBuilderScreenState extends State<ProfileBuilderScreen> {
     _brgyController.dispose();
     _cityController.dispose();
     _provinceController.dispose();
-    _gradeLevelController.removeListener(_updateHighSchoolLevel);
-    _gradeLevelController.dispose();
-    _sectionController.dispose();
-    _highSchoolLevelController.dispose();
+    // Removed: _gradeLevelController.dispose(), _sectionController.dispose(), _highSchoolLevelController.dispose()
     super.dispose();
   }
 
-  void _updateHighSchoolLevel() {
-    final input = _gradeLevelController.text;
-    final gradeLevel = int.tryParse(input);
-    if (gradeLevel != null) {
-      if (gradeLevel >= 11 && gradeLevel <= 12) {
-        _highSchoolLevelController.text = 'Senior High School';
-      } else if (gradeLevel >= 7 && gradeLevel <= 10) {
-        _highSchoolLevelController.text = 'Junior High School';
-      } else {
-        _highSchoolLevelController.text =
-            'Please input an appropriate grade level.';
-      }
-    } else {
-      _highSchoolLevelController.text = '';
-    }
-  }
+  // Removed: _updateHighSchoolLevel method
 
   Future<void> _pickImage() async {
     final pickedFile = await picker.pickImage(source: ImageSource.gallery);
@@ -137,17 +121,15 @@ class ProfileBuilderScreenState extends State<ProfileBuilderScreen> {
       );
     }
 
-    // Resolve gender value (dropdown or self-described)
     final String genderValue =
         (_genderValue == 'Self-describe')
             ? _customGenderController.text.trim()
             : (_genderValue ?? '').trim();
 
-    // keep controller in sync (if other parts of app read it)
     _genderController.text = genderValue;
 
     final profileData = {
-      'supabase_id': widget.userId, // ✅ Correct column name
+      'supabase_id': widget.userId,
       'first_name': _firstNameController.text.trim(),
       'middle_name': _middleNameController.text.trim(),
       'last_name': _lastNameController.text.trim(),
@@ -159,9 +141,7 @@ class ProfileBuilderScreenState extends State<ProfileBuilderScreen> {
       'brgy': _brgyController.text.trim(),
       'city': _cityController.text.trim(),
       'province': _provinceController.text.trim(),
-      'grade_level': _gradeLevelController.text.trim(),
-      'section': _sectionController.text.trim(),
-      'school_level': _highSchoolLevelController.text.trim(),
+      // Removed: 'grade_level', 'section', 'school_level'
       if (avatarUrl != null) 'profile_picture': avatarUrl,
     };
 
@@ -195,6 +175,28 @@ class ProfileBuilderScreenState extends State<ProfileBuilderScreen> {
     } finally {
       setState(() => _isSaving = false);
     }
+  }
+
+  // API Helper for Barangay Suggestions (using PhilAtlas for Bulacan barangays)
+  Future<List<String>> _fetchBarangaySuggestions(String query) async {
+    if (query.isEmpty) return [];
+    try {
+      final response = await http.get(
+        Uri.parse(
+          'https://psgc.gitlab.io/api/provinces/031400000/barangays/?name_like=$query',
+        ),
+      );
+      if (response.statusCode == 200) {
+        final data = json.decode(response.body) as List;
+        final suggestions = data.map((e) => e['name'] as String).toList();
+        return suggestions
+            .where((name) => name.toLowerCase().contains(query.toLowerCase()))
+            .toList();
+      }
+    } catch (e) {
+      debugPrint('API error: $e');
+    }
+    return [];
   }
 
   @override
@@ -244,7 +246,6 @@ class ProfileBuilderScreenState extends State<ProfileBuilderScreen> {
                       ),
                       const SizedBox(height: 20),
 
-                      // --- Name fields with placeholders ---
                       _buildTextField(
                         'First Name',
                         controller: _firstNameController,
@@ -262,7 +263,6 @@ class ProfileBuilderScreenState extends State<ProfileBuilderScreen> {
                       ),
                       _buildTextField('Suffix', controller: _suffixController),
 
-                      // --- Gender dropdown (LGBTQIA+ inclusive) ---
                       _buildGenderDropdown(
                         value: _genderValue,
                         onChanged: (val) {
@@ -281,47 +281,27 @@ class ProfileBuilderScreenState extends State<ProfileBuilderScreen> {
 
                       _buildDateField(context),
 
-                      // --- Username with placeholder ---
                       _buildTextField(
                         'Username',
                         controller: _usernameController,
                         hintText: 'e.g., juan.reyes11',
                       ),
 
-                      // --- Address ---
+                      // Location fields with improvements
                       _buildTextField('Street', controller: _streetController),
-                      _buildTextField('Brgy', controller: _brgyController),
-                      _buildTextField('City', controller: _cityController),
-
-                      // --- Province with placeholder ---
+                      _buildBarangayField(), // Autocomplete for barangay
+                      _buildTextField(
+                        'City',
+                        controller: _cityController,
+                        enabled: false, // Pre-filled, read-only
+                      ),
                       _buildTextField(
                         'Province',
                         controller: _provinceController,
-                        hintText: 'e.g., Bulacan',
+                        enabled: false, // Pre-filled, read-only
                       ),
 
-                      // --- Grade level with placeholder ---
-                      _buildTextField(
-                        'Grade Level (7 - 12)',
-                        controller: _gradeLevelController,
-                        keyboardType: TextInputType.number,
-                        hintText: 'e.g., 11',
-                      ),
-
-                      // --- Section name only with placeholder ---
-                      _buildTextField(
-                        'Section',
-                        controller: _sectionController,
-                        hintText: 'e.g., Einstein (no grade level)',
-                      ),
-
-                      // --- Derived school level (disabled) ---
-                      _buildTextField(
-                        'High School Level',
-                        controller: _highSchoolLevelController,
-                        enabled: false,
-                      ),
-
+                      // Removed: Grade Level, Section, High School Level fields
                       const SizedBox(height: 20),
                       Center(
                         child: ElevatedButton(
@@ -401,7 +381,6 @@ class ProfileBuilderScreenState extends State<ProfileBuilderScreen> {
                 )
                 .toList(),
         onChanged: (val) {
-          // Keep local state and controller in sync
           onChanged(val);
           if (val != null && val != 'Self-describe') {
             _customGenderController.clear();
@@ -437,6 +416,51 @@ class ProfileBuilderScreenState extends State<ProfileBuilderScreen> {
             ),
           ),
         ),
+      ),
+    );
+  }
+
+  // Barangay autocomplete field using TypeAheadField and PhilAtlas API
+  Widget _buildBarangayField() {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 8.0),
+      child: TypeAheadField<String>(
+        builder: (context, controller, focusNode) {
+          return TextField(
+            controller: controller,
+            focusNode: focusNode,
+            style: const TextStyle(fontFamily: 'Inter'),
+            decoration: InputDecoration(
+              labelText: 'Barangay',
+              hintText: 'e.g., Pagala',
+              labelStyle: const TextStyle(fontFamily: 'Inter', fontSize: 16),
+              filled: true,
+              fillColor: Colors.white,
+              border: OutlineInputBorder(
+                borderRadius: BorderRadius.circular(10),
+              ),
+            ),
+          );
+        },
+        suggestionsCallback: _fetchBarangaySuggestions,
+        itemBuilder:
+            (context, suggestion) => ListTile(
+              title: Text(
+                suggestion,
+                style: const TextStyle(fontFamily: 'Inter'),
+              ),
+            ),
+        onSelected: (suggestion) {
+          _brgyController.text = suggestion;
+        },
+        emptyBuilder:
+            (context) => const Padding(
+              padding: EdgeInsets.all(8.0),
+              child: Text(
+                'No barangays found',
+                style: TextStyle(fontFamily: 'Inter'),
+              ),
+            ),
       ),
     );
   }

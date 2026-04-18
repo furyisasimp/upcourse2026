@@ -29,7 +29,8 @@ class HomeScreen extends StatefulWidget {
 
 class HomeScreenState extends State<HomeScreen> {
   String _firstName = 'Guest';
-  String _gradeLevel = '';
+  String _gradeLevel = ''; // Keep for other uses if needed
+  String _course = ''; // NEW: Add course variable
   int _topNavIndex = 0; // 0=Home, 1=Assessment, 2=Exploration, 3=Skills
 
   // Career setup flags (RIASEC only for this screen)
@@ -75,19 +76,26 @@ class HomeScreenState extends State<HomeScreen> {
       if (!mounted) return;
 
       if (profile != null) {
+        final courseLabel = profile['course_label'] ?? '';
+        final courseCode = profile['course_code'] ?? '';
+        final course = courseLabel.isNotEmpty ? courseLabel : courseCode;
+
         setState(() {
           _firstName = profile['first_name'] ?? 'Guest';
           _gradeLevel = profile['grade_level']?.toString() ?? '';
+          _course = course; // Ensure this is set to the selected course
         });
       } else {
         setState(() {
           _firstName = SupabaseService.authEmail ?? 'Guest';
+          _course = '';
         });
       }
-    } catch (_) {
+    } catch (e) {
       if (!mounted) return;
       setState(() {
         _firstName = SupabaseService.authEmail ?? 'Guest';
+        _course = '';
       });
     }
   }
@@ -392,7 +400,7 @@ class HomeScreenState extends State<HomeScreen> {
                   ),
                   child: Row(
                     children: [
-                      Expanded(child: _headerWelcome(_firstName, _gradeLevel)),
+                      Expanded(child: _headerWelcome(_firstName, _course)),
                       InkWell(
                         onTap: () {},
                         child: Container(
@@ -592,7 +600,7 @@ class HomeScreenState extends State<HomeScreen> {
 
   // ---------- UI pieces ----------
 
-  Widget _headerWelcome(String name, String gradeLevel) {
+  Widget _headerWelcome(String name, String course) {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
@@ -609,8 +617,8 @@ class HomeScreenState extends State<HomeScreen> {
         AnimatedSwitcher(
           duration: const Duration(milliseconds: 250),
           child: Text(
-            gradeLevel.isNotEmpty ? 'Grade $gradeLevel – Student' : 'Student',
-            key: ValueKey(gradeLevel),
+            course.isNotEmpty ? '$course Student' : 'Student',
+            key: ValueKey(course),
             style: const TextStyle(
               fontFamily: 'Inter',
               color: Colors.white70,

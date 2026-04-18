@@ -5,8 +5,13 @@ import 'package:career_roadmap/services/supabase_service.dart';
 
 class QuizIntroScreen extends StatefulWidget {
   final String categoryId; // treat as quizId
+  final String storagePath; // Add this
 
-  const QuizIntroScreen({super.key, required this.categoryId});
+  const QuizIntroScreen({
+    Key? key,
+    required this.categoryId,
+    required this.storagePath,
+  }) : super(key: key);
 
   @override
   State<QuizIntroScreen> createState() => _QuizIntroScreenState();
@@ -190,6 +195,7 @@ class _QuizIntroScreenState extends State<QuizIntroScreen>
                     _header!.quizId.isNotEmpty
                         ? _header!.quizId
                         : widget.categoryId,
+                storagePath: widget.storagePath, // Add this
               ),
             ),
       ),
@@ -209,6 +215,7 @@ class _QuizIntroScreenState extends State<QuizIntroScreen>
                     _header!.quizId.isNotEmpty
                         ? _header!.quizId
                         : widget.categoryId,
+                storagePath: widget.storagePath, // Add this
               ),
             ),
       ),

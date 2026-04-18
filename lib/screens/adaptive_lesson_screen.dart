@@ -1,345 +1,263 @@
-import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:flutter_markdown/flutter_markdown.dart';
-import 'package:supabase_flutter/supabase_flutter.dart';
+import 'package:http/http.dart' as http;
+import 'dart:convert';
+import 'package:career_roadmap/services/module_service.dart';
 import 'package:career_roadmap/services/supabase_service.dart';
-import 'package:career_roadmap/screens/skills_screen.dart';
 
 class AdaptiveLessonScreen extends StatefulWidget {
   final String moduleId;
   final String title;
 
   const AdaptiveLessonScreen({
-    super.key,
     required this.moduleId,
     required this.title,
-  });
+    Key? key,
+  }) : super(key: key);
 
   @override
-  State<AdaptiveLessonScreen> createState() => _AdaptiveLessonScreenState();
+  _AdaptiveLessonScreenState createState() => _AdaptiveLessonScreenState();
 }
 
 class _AdaptiveLessonScreenState extends State<AdaptiveLessonScreen> {
-  List<Map<String, dynamic>> lessons = [];
-  int currentIndex = 0;
-  bool isLoading = true;
-  String? _inlineError;
+  Map<String, dynamic>? _moduleData;
+  bool _isLoading = true;
+  int _currentLessonIndex = 0;
+  Map<int, String> _preloadedContent = {}; // Preload markdown for each lesson
+  Map<int, int?> _userAnswers = {}; // Track selected MCQ answers
+  Map<int, bool?> _answerFeedback =
+      {}; // Track feedback (true=correct, false=incorrect)
 
   @override
   void initState() {
     super.initState();
-    _loadLessons();
+    _loadModule();
   }
 
-  Future<void> _loadLessons() async {
-    final data = await SupabaseService.loadSkillModule(widget.moduleId);
-    if (!mounted) return;
-
-    if (data.isEmpty) {
-      setState(() {
-        isLoading = false;
-        _inlineError = 'No lessons found for ${widget.moduleId}.';
-      });
-      return;
-    }
-
-    setState(() {
-      lessons = data;
-      isLoading = false;
-    });
-
-    // Hydrate markdown bodies from storage:// URLs if needed
-    await _hydrateAllMissingContent();
-
-    // Continue where the user left off
-    final progress = await SupabaseService.getSkillProgress();
-    final module = progress.firstWhere(
-      (p) => p['module_id'] == widget.moduleId,
-      orElse: () => {},
+  Future<void> _loadModule() async {
+    setState(() => _isLoading = true);
+    final data = await ModuleService.loadModuleByStrand(
+      moduleId: widget.moduleId,
     );
-
-    if (!mounted) return;
-    if (module.isNotEmpty) {
-      setState(() {
-        currentIndex = (module['lessons_completed'] as int?) ?? 0;
-        if (currentIndex >= lessons.length) currentIndex = 0;
-      });
+    if (data != null) {
+      await _preloadContent(data);
+    }
+    setState(() {
+      _moduleData = data;
+      _isLoading = false;
+    });
+    if (data == null) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Module not available. Please try again.'),
+        ),
+      );
     }
   }
 
-  /// Parse storage://<bucket>/<path> → (bucket, path), normalizing bucket name.
-  (String, String)? _parseStorageUrl(String? url) {
-    if (url == null) return null;
-    final u = url.trim();
-    if (!u.startsWith('storage://')) return null;
-    final rest = u.substring('storage://'.length);
-    final slash = rest.indexOf('/');
-    if (slash <= 0) return null;
-    var bucket = rest.substring(0, slash);
-    final path = rest.substring(slash + 1);
-    if (bucket == 'skills-module') bucket = 'skill-modules'; // legacy typo
-    return (bucket, path);
-  }
-
-  /// Download text content and attach to lesson['content_md'] if missing.
-  Future<void> _hydrateAllMissingContent() async {
-    final client = Supabase.instance.client;
-    String? firstError;
-
+  Future<void> _preloadContent(Map<String, dynamic> moduleData) async {
+    final lessons = moduleData['lessons'] as List<dynamic>? ?? [];
     for (int i = 0; i < lessons.length; i++) {
-      final m = lessons[i];
-      final hasMd = (m['content_md'] ?? '').toString().trim().isNotEmpty;
-      final url = (m['content_url'] ?? '').toString().trim();
-      if (hasMd || url.isEmpty) continue;
-
-      final parsed = _parseStorageUrl(url);
-      if (parsed == null) {
-        firstError ??= 'Invalid content_url: $url';
-        continue;
+      final lesson = lessons[i] as Map<String, dynamic>;
+      final contentUrl = lesson['content_url'] as String?;
+      if (contentUrl != null) {
+        final fullUrl = contentUrl.replaceFirst(
+          'storage://skills-module/',
+          'https://aybgkbtwkavtluzemlst.supabase.co/storage/v1/object/public/skill-modules/', // Update with your real URL!
+        );
+        debugPrint('Attempting to fetch MD from: $fullUrl'); // Add this
+        try {
+          final response = await http
+              .get(Uri.parse(fullUrl))
+              .timeout(const Duration(seconds: 10));
+          debugPrint(
+            'MD fetch response status: ${response.statusCode}',
+          ); // Add this
+          if (response.statusCode == 200) {
+            _preloadedContent[i] = response.body;
+          } else {
+            debugPrint(
+              'MD fetch failed with body: ${response.body}',
+            ); // Add this
+            _preloadedContent[i] =
+                'Content not available (status ${response.statusCode}).';
+          }
+        } catch (e) {
+          debugPrint('MD fetch error: $e'); // Add this
+          _preloadedContent[i] = 'Error loading content: $e';
+        }
       }
-
-      final (bucket, path) = parsed;
-
-      try {
-        final bytes = await client.storage.from(bucket).download(path);
-        final text = utf8.decode(bytes);
-        if (!mounted) return;
-        setState(() {
-          lessons[i] = {...m, 'content_md': text};
-        });
-      } catch (e) {
-        firstError ??= 'Failed to fetch $bucket/$path: $e';
-      }
-    }
-
-    if (firstError != null && mounted) {
-      setState(() {
-        _inlineError = firstError;
-      });
     }
   }
 
-  Future<void> _updateProgress() async {
-    await SupabaseService.updateSkillProgress(
+  void _nextLesson() {
+    final lessons = _moduleData?['lessons'] as List<dynamic>? ?? [];
+    if (_currentLessonIndex < lessons.length - 1) {
+      setState(() => _currentLessonIndex++);
+      _updateProgress();
+    } else {
+      _completeModule();
+    }
+  }
+
+  void _previousLesson() {
+    if (_currentLessonIndex > 0) {
+      setState(() => _currentLessonIndex--);
+    }
+  }
+
+  void _updateProgress() {
+    final lessons = _moduleData?['lessons'] as List<dynamic>? ?? [];
+    SupabaseService.updateSkillProgress(
       widget.moduleId,
-      currentIndex,
+      _currentLessonIndex + 1, // 1-based index
       lessons.length,
     );
   }
 
-  void _nextLesson() async {
-    if (currentIndex < lessons.length - 1) {
-      setState(() => currentIndex++);
-      await _updateProgress();
-    } else {
-      // finished module
-      await SupabaseService.updateSkillProgress(
-        widget.moduleId,
-        lessons.length,
-        lessons.length,
-      );
-      if (!mounted) return;
-      Navigator.pushReplacement(
-        context,
-        MaterialPageRoute(builder: (_) => const SkillsScreen()),
+  void _completeModule() {
+    final lessons = _moduleData?['lessons'] as List<dynamic>? ?? [];
+    SupabaseService.updateSkillProgress(
+      widget.moduleId,
+      lessons.length,
+      lessons.length,
+    );
+    ScaffoldMessenger.of(
+      context,
+    ).showSnackBar(const SnackBar(content: Text('Module completed!')));
+    Navigator.pop(context);
+  }
+
+  void _checkAnswer(int questionIndex, Map<String, dynamic> q) {
+    final selected = _userAnswers[questionIndex];
+    if (selected != null) {
+      final isCorrect = selected == q['answer_index'];
+      setState(() => _answerFeedback[questionIndex] = isCorrect);
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(isCorrect ? 'Correct!' : 'Incorrect. Try again.'),
+          backgroundColor: isCorrect ? Colors.green : Colors.red,
+        ),
       );
     }
   }
 
-  void _prevLesson() async {
-    if (currentIndex > 0) {
-      setState(() => currentIndex--);
-      await _updateProgress();
-    }
+  Widget _buildLesson() {
+    final lessons = _moduleData?['lessons'] as List<dynamic>? ?? [];
+    if (_currentLessonIndex >= lessons.length)
+      return const Text('No more lessons.');
+
+    final lesson = lessons[_currentLessonIndex] as Map<String, dynamic>;
+    final practice = lesson['practice'] as List<dynamic>? ?? [];
+    final totalLessons = lessons.length;
+
+    // _buildLesson method
+    return SingleChildScrollView(
+      padding: const EdgeInsets.all(16),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          // Lesson Progress
+          Text(
+            'Lesson ${_currentLessonIndex + 1} of $totalLessons',
+            style: const TextStyle(fontSize: 16, color: Colors.grey),
+          ),
+          const SizedBox(height: 8),
+          Text(
+            lesson['title'],
+            style: const TextStyle(fontSize: 24, fontWeight: FontWeight.bold),
+          ),
+          const SizedBox(height: 16),
+
+          // Preloaded Markdown Content
+          Markdown(
+            data: _preloadedContent[_currentLessonIndex]!,
+            shrinkWrap: true, // <-- Add this to fix unbounded height
+          ),
+          const SizedBox(height: 16),
+
+          // MCQs
+          for (int i = 0; i < practice.length; i++) _buildMCQ(practice[i], i),
+          const SizedBox(height: 16),
+
+          // Navigation Buttons
+          Row(
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            children: [
+              ElevatedButton(
+                onPressed: _currentLessonIndex > 0 ? _previousLesson : null,
+                child: const Text('Previous'),
+              ),
+              ElevatedButton(
+                onPressed: _nextLesson,
+                child: Text(
+                  _currentLessonIndex == totalLessons - 1 ? 'Complete' : 'Next',
+                ),
+              ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildMCQ(Map<String, dynamic> q, int questionIndex) {
+    final options = q['options'] as List<dynamic>;
+    final selected = _userAnswers[questionIndex];
+    final feedback = _answerFeedback[questionIndex];
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text(
+          q['question'],
+          style: const TextStyle(fontWeight: FontWeight.bold),
+        ),
+        const SizedBox(height: 8),
+        for (int i = 0; i < options.length; i++)
+          RadioListTile<int>(
+            title: Text(options[i]),
+            value: i,
+            groupValue: selected,
+            activeColor:
+                feedback == true
+                    ? Colors.green
+                    : (feedback == false ? Colors.red : null),
+            onChanged:
+                (value) => setState(() => _userAnswers[questionIndex] = value),
+          ),
+        if (selected != null)
+          ElevatedButton(
+            onPressed: () => _checkAnswer(questionIndex, q),
+            child: const Text('Check Answer'),
+          ),
+      ],
+    );
   }
 
   @override
   Widget build(BuildContext context) {
-    if (isLoading) {
-      return const Scaffold(body: Center(child: CircularProgressIndicator()));
-    }
-
-    if (lessons.isEmpty) {
-      return const Scaffold(
-        body: Center(
-          child: Text(
-            "No lessons found for this module.",
-            style: TextStyle(fontFamily: 'Inter'),
-          ),
-        ),
-      );
-    }
-
-    final lesson = lessons[currentIndex];
-    final String title = (lesson['title'] ?? '').toString().trim();
-    final String md = (lesson['content_md'] ?? '').toString().trim();
-    final String summary = (lesson['content_summary'] ?? '').toString().trim();
-    final int practiceCount =
-        lesson['practice'] is List ? (lesson['practice'] as List).length : 0;
-
     return Scaffold(
       appBar: AppBar(
-        title: Text(
-          widget.title,
-          style: const TextStyle(
-            fontFamily: 'Poppins',
-            fontWeight: FontWeight.w600,
-          ),
-        ),
+        title: Text(widget.title),
         backgroundColor: const Color(0xFF3EB6FF),
-        foregroundColor: Colors.white,
+        actions: [
+          if (_moduleData != null)
+            Padding(
+              padding: const EdgeInsets.all(16),
+              child: Text(
+                '${_currentLessonIndex + 1}/${(_moduleData!['lessons'] as List).length}',
+                style: const TextStyle(fontSize: 16),
+              ),
+            ),
+        ],
       ),
-      body: Padding(
-        padding: const EdgeInsets.all(16),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            LinearProgressIndicator(
-              value: (currentIndex + 1) / lessons.length,
-              backgroundColor: Colors.grey.shade300,
-              color: Colors.black,
-            ),
-            const SizedBox(height: 16),
-            Text(
-              "Lesson ${currentIndex + 1} of ${lessons.length}",
-              style: const TextStyle(
-                fontFamily: 'Poppins',
-                fontWeight: FontWeight.w600,
-                fontSize: 18,
-              ),
-            ),
-            const SizedBox(height: 8),
-            if (_inlineError != null)
-              Padding(
-                padding: const EdgeInsets.only(bottom: 6),
-                child: Text(
-                  _inlineError!,
-                  style: const TextStyle(
-                    fontFamily: 'Inter',
-                    fontSize: 12,
-                    color: Colors.redAccent,
-                  ),
-                ),
-              ),
-            const SizedBox(height: 6),
-            Expanded(
-              child: SingleChildScrollView(
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Text(
-                      title,
-                      style: const TextStyle(
-                        fontFamily: 'Poppins',
-                        fontSize: 20,
-                        fontWeight: FontWeight.w700,
-                      ),
-                    ),
-                    const SizedBox(height: 10),
-
-                    // Prefer Markdown body; fallback to summary; otherwise info text.
-                    if (md.isNotEmpty)
-                      MarkdownBody(
-                        data: md,
-                        styleSheet: MarkdownStyleSheet.fromTheme(
-                          Theme.of(context),
-                        ).copyWith(
-                          p: const TextStyle(fontFamily: 'Inter', fontSize: 16),
-                          h1: const TextStyle(
-                            fontFamily: 'Poppins',
-                            fontWeight: FontWeight.w700,
-                          ),
-                          h2: const TextStyle(
-                            fontFamily: 'Poppins',
-                            fontWeight: FontWeight.w700,
-                          ),
-                        ),
-                      )
-                    else if (summary.isNotEmpty)
-                      Text(
-                        summary,
-                        style: const TextStyle(
-                          fontFamily: 'Inter',
-                          fontSize: 16,
-                          fontWeight: FontWeight.w400,
-                        ),
-                      )
-                    else
-                      Builder(
-                        builder: (context) {
-                          final url = (lesson['content_url'] ?? '').toString();
-                          return Text(
-                            url.isNotEmpty
-                                ? 'No inline content. Attached: $url'
-                                : 'No content provided for this lesson.',
-                            style: const TextStyle(
-                              fontFamily: 'Inter',
-                              fontSize: 14,
-                              color: Colors.black54,
-                            ),
-                          );
-                        },
-                      ),
-
-                    if (practiceCount > 0) ...[
-                      const SizedBox(height: 16),
-                      Text(
-                        'Practice items: $practiceCount',
-                        style: const TextStyle(
-                          fontFamily: 'Inter',
-                          fontSize: 13,
-                          color: Colors.black54,
-                        ),
-                      ),
-                    ],
-                  ],
-                ),
-              ),
-            ),
-            const SizedBox(height: 20),
-            Row(
-              children: [
-                if (currentIndex > 0)
-                  Expanded(
-                    child: ElevatedButton(
-                      onPressed: _prevLesson,
-                      style: ElevatedButton.styleFrom(
-                        backgroundColor: Colors.white,
-                        foregroundColor: Colors.black,
-                      ),
-                      child: const Text(
-                        "Previous",
-                        style: TextStyle(
-                          fontFamily: 'Inter',
-                          fontWeight: FontWeight.w500,
-                        ),
-                      ),
-                    ),
-                  ),
-                if (currentIndex > 0) const SizedBox(width: 12),
-                Expanded(
-                  child: ElevatedButton(
-                    onPressed: _nextLesson,
-                    style: ElevatedButton.styleFrom(
-                      backgroundColor: Colors.black,
-                      foregroundColor: Colors.white,
-                    ),
-                    child: Text(
-                      currentIndex == lessons.length - 1
-                          ? "Finish"
-                          : "Next Lesson",
-                      style: const TextStyle(
-                        fontFamily: 'Inter',
-                        fontWeight: FontWeight.w500,
-                      ),
-                    ),
-                  ),
-                ),
-              ],
-            ),
-          ],
-        ),
-      ),
+      body:
+          _isLoading
+              ? const Center(child: CircularProgressIndicator())
+              : _moduleData != null
+              ? _buildLesson()
+              : const Center(child: Text('Failed to load module.')),
     );
   }
 }

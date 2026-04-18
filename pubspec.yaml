@@ -28,6 +28,8 @@ dependencies:
   pdfx: ^2.6.0
   syncfusion_flutter_pdfviewer: ^31.1.19
   screen_capture_event: ^1.2.0
+  flutter_typeahead: ^5.2.0
+  flutter_keyboard_visibility: ^6.0.0
 
 dev_dependencies:
   flutter_test:

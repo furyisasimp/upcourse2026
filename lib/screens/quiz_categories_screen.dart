@@ -90,42 +90,83 @@ class _QuizCategoriesScreenState extends State<QuizCategoriesScreen> {
         path: '',
       );
 
-      String _toId(String name) {
-        final base =
-            name.toLowerCase().endsWith('.json')
-                ? name.substring(0, name.length - 5)
-                : name;
-        final noPrefix =
-            base.startsWith('quiz_') ? base.substring('quiz_'.length) : base;
-        return noPrefix.toUpperCase(); // ABM, GAS, STEM, TECHPRO or custom ids
+      // Filter to JSON files
+      final jsonFiles =
+          files.where((f) => f.toLowerCase().endsWith('.json')).toList();
+
+      if (jsonFiles.isEmpty) {
+        _applyFallback();
+        return;
       }
 
-      final ids =
-          files
-              .where((f) => f.toLowerCase().endsWith('.json'))
-              .map(_toId)
-              .toSet()
-              .toList();
+      // Fetch each JSON to extract quiz_id, quiz_title, storage_path, and other dynamic data
+      final categories = <Map<String, dynamic>>[];
+      for (final file in jsonFiles) {
+        try {
+          // Fetch the JSON content
+          final jsonData = await SupabaseService.fetchQuizJsonByPath(file);
+          if (jsonData != null && jsonData['quiz_id'] != null) {
+            final quizId = jsonData['quiz_id'] as String;
+            final quizTitle =
+                jsonData['quiz_title'] as String? ?? 'Untitled Quiz';
+            final storagePath =
+                jsonData['storage_path'] as String? ??
+                file; // Use storage_path if available, else fallback to file name
+            final quizType = jsonData['type'] as String? ?? 'General';
 
-      if (ids.isEmpty) {
+            // Dynamic icon and color based on type (or use defaults)
+            IconData icon;
+            Color color;
+            switch (quizType.toLowerCase()) {
+              case 'career interest':
+                icon = Icons.business_center_outlined;
+                color = const Color(0xFF4CAF50); // Green for career-related
+                break;
+              case 'academic':
+                icon = Icons.school_outlined;
+                color = const Color(0xFF2196F3); // Blue for academic
+                break;
+              default:
+                icon = Icons.quiz_outlined;
+                color = const Color(0xFF81D4FA); // Default neutral
+            }
+
+            // Check if it's a known strand (fallback to _meta if needed)
+            final knownMeta = _meta[quizId];
+            if (knownMeta != null) {
+              // Use _meta for legacy strands
+              categories.add({
+                'id': quizId,
+                'title': knownMeta.title,
+                'icon': knownMeta.icon,
+                'color': knownMeta.color,
+                'storage_path': storagePath, // Add storage_path
+              });
+            } else {
+              // Use JSON data for dynamic quizzes
+              categories.add({
+                'id': quizId,
+                'title': quizTitle,
+                'icon': icon,
+                'color': color,
+                'storage_path': storagePath, // Add storage_path
+              });
+            }
+          }
+        } catch (e) {
+          // Skip invalid files
+          debugPrint('Failed to load quiz from $file: $e');
+        }
+      }
+
+      if (categories.isEmpty) {
         _applyFallback();
       } else {
-        _categories =
-            ids.map((id) {
-              final info =
-                  _meta[id] ??
-                  (
-                    title: '$id — Practice Quiz',
-                    icon: Icons.quiz_outlined,
-                    color: const Color(0xFF81D4FA),
-                  );
-              return {
-                'id': id,
-                'title': info.title,
-                'icon': info.icon,
-                'color': info.color,
-              };
-            }).toList();
+        // Sort for consistent order (e.g., by title or ID)
+        categories.sort(
+          (a, b) => (a['title'] as String).compareTo(b['title'] as String),
+        );
+        _categories = categories;
       }
     } catch (e) {
       _applyFallback();
@@ -185,6 +226,7 @@ class _QuizCategoriesScreenState extends State<QuizCategoriesScreen> {
             icon: cat['icon'] as IconData,
             color: cat['color'] as Color,
             status: status,
+            storagePath: cat['storage_path'] as String, // Add from cat map
           ).toMap();
         }),
       );
@@ -221,14 +263,20 @@ class _QuizCategoriesScreenState extends State<QuizCategoriesScreen> {
 
   void _onItemTapped(int index) => setState(() => _selectedIndex = index);
 
-  void _navigateToIntro(String categoryId) {
+  void _navigateToIntro(String categoryId, String storagePath) {
+    // Add storagePath parameter
+    print(
+      'Navigating to QuizIntroScreen with categoryId: $categoryId, storagePath: $storagePath',
+    ); // DEBUG
     Navigator.of(context).push(
       PageRouteBuilder(
         transitionDuration: const Duration(milliseconds: 300),
         reverseTransitionDuration: const Duration(milliseconds: 200),
         pageBuilder:
-            (context, animation, secondaryAnimation) =>
-                QuizIntroScreen(categoryId: categoryId),
+            (context, animation, secondaryAnimation) => QuizIntroScreen(
+              categoryId: categoryId,
+              storagePath: storagePath,
+            ), // Pass storagePath
         transitionsBuilder: (context, animation, secondaryAnimation, child) {
           final fade = CurvedAnimation(
             parent: animation,
@@ -250,12 +298,12 @@ class _QuizCategoriesScreenState extends State<QuizCategoriesScreen> {
   // Responsive helpers
   (double hPad, int cols, double aspect) _layoutSpec(BuildContext context) {
     final w = MediaQuery.of(context).size.width;
-    if (w >= 1400) return (32, 4, 1.05);
-    if (w >= 1100) return (28, 4, 1.02);
-    if (w >= 900) return (24, 3, 1.0);
-    if (w >= 700) return (22, 2, 0.95);
-    if (w >= 520) return (18, 2, 0.9);
-    return (16, 1, 1.55);
+    if (w >= 1400) return (w * 0.05, 4, 1.0); // 5% of width for large screens
+    if (w >= 1100) return (w * 0.04, 4, 1.0);
+    if (w >= 900) return (w * 0.035, 3, 1.05);
+    if (w >= 700) return (w * 0.03, 2, 1.1);
+    if (w >= 520) return (w * 0.025, 2, 1.15);
+    return (w * 0.02, 1, 1.2); // 2% for very small screens
   }
 
   List<Map<String, dynamic>> _applySearchAndFilter() {
@@ -283,19 +331,19 @@ class _QuizCategoriesScreenState extends State<QuizCategoriesScreen> {
   Widget build(BuildContext context) {
     final busy = _loading || _checkingLocks;
     final (hPad, cols, aspect) = _layoutSpec(context);
+    final screenWidth = MediaQuery.of(context).size.width;
 
     return Scaffold(
       backgroundColor: const Color(0xFFF7FBFF),
       appBar: AppBar(
-        automaticallyImplyLeading: false,
-        backgroundColor: const Color(0xFFF7FBFF),
         elevation: 0,
+        backgroundColor: const Color(0xFFF7FBFF),
         centerTitle: true,
-        title: const Text(
+        title: Text(
           'Quizzes',
           style: TextStyle(
             fontFamily: 'Poppins',
-            fontSize: 20,
+            fontSize: screenWidth < 600 ? 18 : 20, // Responsive font
             fontWeight: FontWeight.w700,
             color: Colors.black87,
           ),
@@ -315,47 +363,109 @@ class _QuizCategoriesScreenState extends State<QuizCategoriesScreen> {
               ? _EmptyState(onRetry: _refreshAll, error: _error)
               : RefreshIndicator(
                 onRefresh: _refreshAll,
-                child: ListView(
-                  padding: EdgeInsets.fromLTRB(hPad, 12, hPad, 16),
-                  children: [
-                    // Search + Filter Row
-                    _SearchAndFilterBar(
-                      initialQuery: _query,
-                      counts: (
-                        all: _available.length + _answered.length,
-                        available: _available.length,
-                        completed: _answered.length,
+                child: SingleChildScrollView(
+                  padding: EdgeInsets.fromLTRB(
+                    hPad,
+                    12,
+                    hPad,
+                    16 + MediaQuery.of(context).padding.bottom,
+                  ),
+                  child: Column(
+                    children: [
+                      // Search + Filter Row
+                      _SearchAndFilterBar(
+                        initialQuery: _query,
+                        counts: {
+                          'all': _available.length + _answered.length,
+                          'available': _available.length,
+                          'completed': _answered.length,
+                        },
+                        onQueryChanged: (q) => setState(() => _query = q),
+                        selected: _filter,
+                        onFilterChanged: (f) => setState(() => _filter = f),
                       ),
-                      onQueryChanged: (q) => setState(() => _query = q),
-                      selected: _filter,
-                      onFilterChanged: (f) => setState(() => _filter = f),
-                    ),
-                    const SizedBox(height: 12),
+                      const SizedBox(height: 12),
 
-                    // Results meta
-                    Builder(
-                      builder: (context) {
-                        final filtered = _applySearchAndFilter();
-                        return _ResultsBanner(
-                          total: filtered.length,
-                          showHint: _query.isNotEmpty,
-                        );
-                      },
-                    ),
-                    const SizedBox(height: 8),
+                      // Results meta
+                      Builder(
+                        builder: (context) {
+                          final filtered = _applySearchAndFilter();
+                          return _ResultsBanner(
+                            total: filtered.length,
+                            showHint: _query.isNotEmpty,
+                          );
+                        },
+                      ),
+                      const SizedBox(height: 8),
 
-                    // Grid (filtered view)
-                    _ResponsiveGrid(
-                      cols: cols,
-                      aspect: aspect,
-                      available: _available,
-                      completed: _answered,
-                      hovering: _hovering,
-                      query: _query,
-                      filter: _filter,
-                      onTapAny: _navigateToIntro, // always go to Intro
-                    ),
-                  ],
+                      // Conditional sections: Separate available and answered when "All" is selected
+                      if (_filter == _Filter.all) ...[
+                        // Available Section
+                        if (_available.isNotEmpty) ...[
+                          _SectionHeader(
+                            title: 'Available Quizzes',
+                            count: _available.length,
+                          ),
+                          const SizedBox(height: 8),
+                          _ResponsiveGrid(
+                            // Removed Flexible
+                            cols: cols,
+                            aspect: aspect,
+                            available: _available,
+                            completed: _answered,
+                            hovering: _hovering,
+                            query: _query,
+                            filter: _Filter.available,
+                            onTapAny:
+                                (id, storagePath) =>
+                                    _navigateToIntro(id, storagePath),
+                          ),
+                          const SizedBox(height: 16),
+                        ],
+
+                        // Answered Section
+                        if (_answered.isNotEmpty) ...[
+                          _SectionHeader(
+                            title: 'Answered Quizzes',
+                            count: _answered.length,
+                          ),
+                          const SizedBox(height: 8),
+                          _ResponsiveGrid(
+                            // Removed Flexible
+                            cols: cols,
+                            aspect: aspect,
+                            available: const [],
+                            completed: _answered,
+                            hovering: _hovering,
+                            query: _query,
+                            filter: _Filter.completed,
+                            onTapAny:
+                                (id, storagePath) => _navigateToIntro(
+                                  id,
+                                  storagePath,
+                                ), // Fixed: Use lambda for consistency
+                          ),
+                        ],
+                      ] else ...[
+                        // Single Grid for "Available" or "Answered" filters
+                        _ResponsiveGrid(
+                          // Removed Flexible
+                          cols: cols,
+                          aspect: aspect,
+                          available: _available,
+                          completed: _answered,
+                          hovering: _hovering,
+                          query: _query,
+                          filter: _filter,
+                          onTapAny:
+                              (id, storagePath) => _navigateToIntro(
+                                id,
+                                storagePath,
+                              ), // Fixed: Use lambda for consistency
+                        ),
+                      ],
+                    ],
+                  ),
                 ),
               ),
       bottomNavigationBar: CustomTaskbar(
@@ -372,7 +482,7 @@ enum _Filter { all, available, completed }
 
 class _SearchAndFilterBar extends StatelessWidget {
   final String initialQuery;
-  final ({int all, int available, int completed}) counts;
+  final Map<String, int> counts;
   final ValueChanged<String> onQueryChanged;
   final _Filter selected;
   final ValueChanged<_Filter> onFilterChanged;
@@ -387,30 +497,41 @@ class _SearchAndFilterBar extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final screenWidth = MediaQuery.of(context).size.width;
+
     return Wrap(
       runSpacing: 10,
       crossAxisAlignment: WrapCrossAlignment.center,
-      spacing: 12,
+      spacing: screenWidth < 600 ? 8 : 12, // Responsive spacing
       children: [
         // Search box
-        SizedBox(
-          width: 420,
-          child: TextField(
-            controller: TextEditingController(text: initialQuery),
-            onChanged: onQueryChanged,
-            textInputAction: TextInputAction.search,
-            decoration: InputDecoration(
-              prefixIcon: const Icon(Icons.search),
-              hintText: 'Search quizzes',
-              filled: true,
-              fillColor: Colors.white,
-              contentPadding: const EdgeInsets.symmetric(
-                horizontal: 12,
-                vertical: 12,
+        ConstrainedBox(
+          constraints: BoxConstraints(
+            maxWidth: screenWidth * 0.8, // 80% of screen width, max 400
+          ),
+          child: SizedBox(
+            width: double.infinity, // Allow it to expand within constraints
+            child: TextField(
+              controller: TextEditingController(text: initialQuery),
+              onChanged: onQueryChanged,
+              textInputAction: TextInputAction.search,
+              style: TextStyle(
+                fontFamily: 'Inter',
+                fontSize: screenWidth < 600 ? 14 : 16, // Responsive font
               ),
-              border: OutlineInputBorder(
-                borderRadius: BorderRadius.circular(12),
-                borderSide: BorderSide.none,
+              decoration: InputDecoration(
+                prefixIcon: const Icon(Icons.search),
+                hintText: 'Search quizzes',
+                filled: true,
+                fillColor: Colors.white,
+                contentPadding: EdgeInsets.symmetric(
+                  horizontal: screenWidth * 0.03, // 3% of width
+                  vertical: 12,
+                ),
+                border: OutlineInputBorder(
+                  borderRadius: BorderRadius.circular(10),
+                  borderSide: BorderSide.none,
+                ),
               ),
             ),
           ),
@@ -418,17 +539,17 @@ class _SearchAndFilterBar extends StatelessWidget {
 
         // Filters
         _FilterChip(
-          label: 'All (${counts.all})',
+          label: 'All (${counts['all'] ?? 0})',
           selected: selected == _Filter.all,
           onTap: () => onFilterChanged(_Filter.all),
         ),
         _FilterChip(
-          label: 'Available (${counts.available})',
+          label: 'Available (${counts['available'] ?? 0})',
           selected: selected == _Filter.available,
           onTap: () => onFilterChanged(_Filter.available),
         ),
         _FilterChip(
-          label: 'Answered (${counts.completed})',
+          label: 'Answered (${counts['completed'] ?? 0})',
           selected: selected == _Filter.completed,
           onTap: () => onFilterChanged(_Filter.completed),
         ),
@@ -450,12 +571,17 @@ class _FilterChip extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final screenWidth = MediaQuery.of(context).size.width;
+
     return InkWell(
       borderRadius: BorderRadius.circular(999),
       onTap: onTap,
       child: AnimatedContainer(
         duration: const Duration(milliseconds: 150),
-        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
+        padding: EdgeInsets.symmetric(
+          horizontal: screenWidth * 0.03, // 3% of width
+          vertical: 8,
+        ),
         decoration: BoxDecoration(
           color: selected ? Colors.black87 : Colors.white,
           borderRadius: BorderRadius.circular(999),
@@ -476,7 +602,7 @@ class _FilterChip extends StatelessWidget {
           style: TextStyle(
             fontFamily: 'Inter',
             fontWeight: FontWeight.w600,
-            fontSize: 13,
+            fontSize: screenWidth < 600 ? 12 : 13, // Responsive font
             color: selected ? Colors.white : Colors.black87,
           ),
         ),
@@ -493,9 +619,14 @@ class _ResultsBanner extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final screenWidth = MediaQuery.of(context).size.width;
+
     return AnimatedContainer(
       duration: const Duration(milliseconds: 200),
-      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+      padding: EdgeInsets.symmetric(
+        horizontal: screenWidth * 0.03, // 3% of width
+        vertical: 10,
+      ),
       decoration: BoxDecoration(
         color: Colors.white,
         borderRadius: BorderRadius.circular(12),
@@ -504,21 +635,22 @@ class _ResultsBanner extends StatelessWidget {
       child: Row(
         children: [
           const Icon(Icons.grid_view_rounded, size: 18),
-          const SizedBox(width: 8),
+          SizedBox(width: screenWidth * 0.02), // 2% of width
           Text(
             '$total result${total == 1 ? '' : 's'}',
-            style: const TextStyle(
+            style: TextStyle(
               fontFamily: 'Inter',
               fontWeight: FontWeight.w600,
+              fontSize: screenWidth < 600 ? 13 : 14, // Responsive font
             ),
           ),
           const Spacer(),
           if (showHint)
-            const Text(
+            Text(
               'Tip: Clear the search to see everything',
               style: TextStyle(
                 fontFamily: 'Inter',
-                fontSize: 12,
+                fontSize: screenWidth < 600 ? 11 : 12, // Responsive font
                 color: Colors.black54,
               ),
             ),
@@ -540,7 +672,8 @@ class _ResponsiveGrid extends StatelessWidget {
   final Map<String, bool> hovering;
   final String query;
   final _Filter filter;
-  final void Function(String id) onTapAny;
+  final void Function(String id, String storagePath)
+  onTapAny; // Update type to accept storagePath
 
   const _ResponsiveGrid({
     required this.cols,
@@ -596,26 +729,41 @@ class _ResponsiveGrid extends StatelessWidget {
       );
     }
 
+    final screenWidth = MediaQuery.of(context).size.width;
+    final tileWidth = screenWidth * 0.42; // ~42% of screen width
+    final maxTileWidth = 280.0; // Cap at 280px for large screens
+
     return GridView.builder(
       itemCount: items.length,
       shrinkWrap: true,
       physics: const NeverScrollableScrollPhysics(),
-      gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
-        crossAxisCount: cols,
-        crossAxisSpacing: 16,
-        mainAxisSpacing: 16,
+      gridDelegate: SliverGridDelegateWithMaxCrossAxisExtent(
+        maxCrossAxisExtent: tileWidth.clamp(
+          120,
+          maxTileWidth,
+        ), // Min 120, max 280
+        crossAxisSpacing: screenWidth * 0.02, // 2% of width
+        mainAxisSpacing: screenWidth * 0.02, // 2% of width
         childAspectRatio: aspect,
       ),
       itemBuilder: (ctx, i) {
         final m = items[i];
         final isHovered = kIsWeb ? (hovering[m.id] ?? false) : false;
+        final tileScreenWidth = MediaQuery.of(ctx).size.width;
 
         final locked = m.status != _QuizStatus.available;
         final gradient = LinearGradient(
           colors:
-              locked
-                  ? [Colors.grey.shade300, Colors.grey.shade200]
-                  : [m.color.withOpacity(0.30), m.color.withOpacity(0.45)],
+              (() {
+                if (m.status == _QuizStatus.available) {
+                  return [m.color.withOpacity(0.30), m.color.withOpacity(0.45)];
+                } else if (m.status == _QuizStatus.awaiting) {
+                  return [Colors.amber.shade200, Colors.amber.shade300];
+                } else if (m.status == _QuizStatus.returned) {
+                  return [Colors.green.shade200, Colors.green.shade300];
+                }
+                return [Colors.grey.shade300, Colors.grey.shade200];
+              })(),
           begin: Alignment.topLeft,
           end: Alignment.bottomRight,
         );
@@ -623,7 +771,7 @@ class _ResponsiveGrid extends StatelessWidget {
         String chipText;
         IconData chipIcon;
         if (m.status == _QuizStatus.available) {
-          chipText = 'Tap to start';
+          chipText = 'Tap to View';
           chipIcon = Icons.play_arrow_rounded;
         } else if (m.status == _QuizStatus.awaiting) {
           chipText = 'Awaiting review · Tap to view';
@@ -634,7 +782,7 @@ class _ResponsiveGrid extends StatelessWidget {
         }
 
         return MouseRegion(
-          cursor: SystemMouseCursors.click, // allow click for both states
+          cursor: SystemMouseCursors.click,
           onEnter: (_) {
             if (!kIsWeb) return;
             hovering[m.id] = true;
@@ -645,112 +793,191 @@ class _ResponsiveGrid extends StatelessWidget {
             hovering[m.id] = false;
             (ctx as Element).markNeedsBuild();
           },
-          child: AnimatedScale(
-            scale: isHovered && !locked ? 1.03 : 1.0,
-            duration: const Duration(milliseconds: 140),
-            child: Material(
-              color: Colors.transparent,
-              borderRadius: BorderRadius.circular(20),
-              child: InkWell(
-                borderRadius: BorderRadius.circular(20),
-                splashColor: m.color.withOpacity(0.25),
-                onTap: () => onTapAny(m.id), // Intro decides start vs view
-                child: Stack(
-                  children: [
-                    AnimatedContainer(
-                      duration: const Duration(milliseconds: 200),
-                      decoration: BoxDecoration(
-                        gradient: gradient,
-                        borderRadius: BorderRadius.circular(20),
-                        boxShadow: [
-                          BoxShadow(
-                            color: (locked ? Colors.black26 : m.color)
-                                .withOpacity(isHovered ? 0.35 : 0.25),
-                            blurRadius: isHovered ? 12 : 8,
-                            offset: const Offset(0, 6),
-                          ),
-                        ],
-                        border: Border.all(
-                          color:
-                              locked
-                                  ? Colors.grey.shade400
-                                  : Colors.transparent,
-                        ),
-                      ),
-                      padding: const EdgeInsets.all(16),
-                      child: Column(
-                        mainAxisAlignment: MainAxisAlignment.center,
-                        children: [
-                          CircleAvatar(
-                            backgroundColor:
-                                locked
-                                    ? Colors.grey
-                                    : m.color.withOpacity(0.95),
-                            radius: 28,
-                            child: Icon(m.icon, color: Colors.white, size: 28),
-                          ),
-                          const SizedBox(height: 12),
-                          Text(
-                            m.title,
-                            textAlign: TextAlign.center,
-                            maxLines: 3,
-                            overflow: TextOverflow.ellipsis,
-                            style: TextStyle(
-                              fontFamily: 'Poppins',
-                              fontSize: 14.5,
-                              fontWeight: FontWeight.w700,
-                              color: Colors.black87.withOpacity(
-                                locked ? 0.65 : 1,
+          child: SizedBox(
+            // Add this to constrain AnimatedScale
+            width: double.infinity,
+            child: AnimatedScale(
+              scale: isHovered && !locked ? 1.03 : 1.0,
+              duration: const Duration(milliseconds: 140),
+              child: ClipRect(
+                // Prevents overflow
+                child: Material(
+                  color: Colors.transparent,
+                  borderRadius: BorderRadius.circular(20),
+                  child: InkWell(
+                    borderRadius: BorderRadius.circular(20),
+                    splashColor: m.color.withOpacity(0.25),
+                    onTap: () => onTapAny(m.id, m.storagePath),
+                    child: Stack(
+                      children: [
+                        AnimatedContainer(
+                          duration: const Duration(milliseconds: 200),
+                          decoration: BoxDecoration(
+                            gradient: gradient,
+                            borderRadius: BorderRadius.circular(20),
+                            boxShadow: [
+                              BoxShadow(
+                                color:
+                                    (() {
+                                      if (m.status == _QuizStatus.available) {
+                                        return m.color.withOpacity(
+                                          isHovered ? 0.35 : 0.25,
+                                        );
+                                      } else if (m.status ==
+                                          _QuizStatus.awaiting) {
+                                        return Colors.amber.withOpacity(
+                                          isHovered ? 0.35 : 0.25,
+                                        );
+                                      } else if (m.status ==
+                                          _QuizStatus.returned) {
+                                        return Colors.green.withOpacity(
+                                          isHovered ? 0.35 : 0.25,
+                                        );
+                                      }
+                                      return Colors.black26.withOpacity(
+                                        isHovered ? 0.35 : 0.25,
+                                      );
+                                    })(),
+                                blurRadius: isHovered ? 12 : 8,
+                                offset: const Offset(0, 6),
                               ),
+                            ],
+                            border: Border.all(
+                              color:
+                                  (() {
+                                    if (m.status == _QuizStatus.available) {
+                                      return Colors.transparent;
+                                    } else if (m.status ==
+                                        _QuizStatus.awaiting) {
+                                      return Colors.amber.shade400;
+                                    } else if (m.status ==
+                                        _QuizStatus.returned) {
+                                      return Colors.green.shade400;
+                                    }
+                                    return Colors.grey.shade400;
+                                  })(),
                             ),
                           ),
-                          const SizedBox(height: 8),
-                          _StatusChip(text: chipText, icon: chipIcon),
-                        ],
-                      ),
-                    ),
-
-                    // Corner badge for awaiting/returned
-                    if (m.status != _QuizStatus.available)
-                      Positioned(
-                        top: 10,
-                        right: 10,
-                        child: Container(
-                          padding: const EdgeInsets.symmetric(
-                            horizontal: 8,
-                            vertical: 4,
-                          ),
-                          decoration: BoxDecoration(
-                            color: Colors.black.withOpacity(0.55),
-                            borderRadius: BorderRadius.circular(10),
-                          ),
-                          child: Row(
+                          padding: EdgeInsets.all(
+                            tileScreenWidth * 0.03,
+                          ), // 3% of tile width
+                          child: Column(
+                            mainAxisAlignment: MainAxisAlignment.center,
                             children: [
-                              Icon(
-                                m.status == _QuizStatus.returned
-                                    ? Icons.check_circle_rounded
-                                    : Icons.hourglass_bottom_rounded,
-                                size: 14,
-                                color: Colors.white,
-                              ),
-                              const SizedBox(width: 4),
-                              Text(
-                                // 🔹 Updated labels per your request
-                                m.status == _QuizStatus.returned
-                                    ? 'Returned'
-                                    : 'To be reviewed',
-                                style: const TextStyle(
-                                  fontFamily: 'Inter',
-                                  fontSize: 11,
+                              CircleAvatar(
+                                backgroundColor:
+                                    (() {
+                                      if (m.status == _QuizStatus.available) {
+                                        return m.color.withOpacity(0.95);
+                                      } else if (m.status ==
+                                          _QuizStatus.awaiting) {
+                                        return Colors.amber.shade600;
+                                      } else if (m.status ==
+                                          _QuizStatus.returned) {
+                                        return Colors.green.shade600;
+                                      }
+                                      return Colors.grey;
+                                    })(),
+                                radius:
+                                    tileScreenWidth * 0.06, // 6% of tile width
+                                child: Icon(
+                                  m.icon,
                                   color: Colors.white,
-                                  fontWeight: FontWeight.w600,
+                                  size:
+                                      tileScreenWidth *
+                                      0.06, // 6% of tile width
                                 ),
                               ),
+                              SizedBox(
+                                height: tileScreenWidth * 0.02,
+                              ), // 2% of tile width
+                              SizedBox(
+                                height:
+                                    tileScreenWidth * 0.12, // 12% of tile width
+                                child: Text(
+                                  m.title,
+                                  textAlign: TextAlign.center,
+                                  maxLines: 3,
+                                  overflow: TextOverflow.ellipsis,
+                                  style: TextStyle(
+                                    fontFamily: 'Poppins',
+                                    fontSize: tileScreenWidth < 600 ? 12 : 14.5,
+                                    fontWeight: FontWeight.w700,
+                                    color: Colors.black87.withOpacity(
+                                      locked ? 0.65 : 1,
+                                    ),
+                                  ),
+                                ),
+                              ),
+                              SizedBox(
+                                height: tileScreenWidth * 0.015,
+                              ), // 1.5% of tile width
+                              _StatusChip(text: chipText, icon: chipIcon),
                             ],
                           ),
                         ),
-                      ),
-                  ],
+
+                        // Corner badge for awaiting/returned
+                        if (m.status != _QuizStatus.available)
+                          Positioned(
+                            top: tileScreenWidth * 0.015, // 1.5% of tile width
+                            right:
+                                tileScreenWidth * 0.015, // 1.5% of tile width
+                            child: Container(
+                              padding: EdgeInsets.symmetric(
+                                horizontal:
+                                    tileScreenWidth * 0.01, // 1% of tile width
+                                vertical:
+                                    tileScreenWidth *
+                                    0.005, // 0.5% of tile width
+                              ),
+                              decoration: BoxDecoration(
+                                color:
+                                    (() {
+                                      if (m.status == _QuizStatus.awaiting) {
+                                        return Colors.amber.withOpacity(0.8);
+                                      } else if (m.status ==
+                                          _QuizStatus.returned) {
+                                        return Colors.green.withOpacity(0.8);
+                                      }
+                                      return Colors.black.withOpacity(0.55);
+                                    })(),
+                                borderRadius: BorderRadius.circular(
+                                  tileScreenWidth * 0.02, // 2% of tile width
+                                ),
+                              ),
+                              child: Row(
+                                children: [
+                                  Icon(
+                                    m.status == _QuizStatus.returned
+                                        ? Icons.check_circle_rounded
+                                        : Icons.hourglass_bottom_rounded,
+                                    size:
+                                        tileScreenWidth *
+                                        0.025, // 2.5% of tile width
+                                    color: Colors.white,
+                                  ),
+                                  SizedBox(
+                                    width: tileScreenWidth * 0.005,
+                                  ), // 0.5% of tile width
+                                  Text(
+                                    m.status == _QuizStatus.returned
+                                        ? 'Returned'
+                                        : 'To be reviewed',
+                                    style: TextStyle(
+                                      fontFamily: 'Inter',
+                                      fontSize: tileScreenWidth < 600 ? 9 : 10,
+                                      color: Colors.white,
+                                      fontWeight: FontWeight.w600,
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ),
+                          ),
+                      ],
+                    ),
+                  ),
                 ),
               ),
             ),
@@ -768,8 +995,13 @@ class _StatusChip extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final screenWidth = MediaQuery.of(context).size.width;
+
     return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+      padding: EdgeInsets.symmetric(
+        horizontal: screenWidth * 0.03, // 3% of width
+        vertical: 6,
+      ),
       decoration: BoxDecoration(
         color: Colors.white,
         borderRadius: BorderRadius.circular(999),
@@ -778,13 +1010,17 @@ class _StatusChip extends StatelessWidget {
       child: Row(
         mainAxisSize: MainAxisSize.min,
         children: [
-          Icon(icon, size: 16, color: Colors.black87),
-          const SizedBox(width: 6),
+          Icon(
+            icon,
+            size: screenWidth * 0.04,
+            color: Colors.black87,
+          ), // 4% of width
+          SizedBox(width: screenWidth * 0.015), // 1.5% of width
           Text(
             text,
-            style: const TextStyle(
+            style: TextStyle(
               fontFamily: 'Inter',
-              fontSize: 12,
+              fontSize: screenWidth < 600 ? 12 : 13, // Responsive font
               color: Colors.black87,
               fontWeight: FontWeight.w600,
             ),
@@ -803,6 +1039,7 @@ class _CardModel {
   final IconData icon;
   final Color color;
   final _QuizStatus status;
+  final String storagePath; // Add this field
 
   _CardModel({
     required this.id,
@@ -810,6 +1047,7 @@ class _CardModel {
     required this.icon,
     required this.color,
     required this.status,
+    required this.storagePath, // Add to constructor
   });
 
   Map<String, dynamic> toMap() => {
@@ -818,6 +1056,7 @@ class _CardModel {
     'icon': icon,
     'color': color,
     'status': status.name,
+    'storage_path': storagePath, // Add to map
   };
 
   static _CardModel fromMap(Map<String, dynamic> m) {
@@ -836,6 +1075,7 @@ class _CardModel {
       icon: m['icon'] as IconData,
       color: m['color'] as Color,
       status: status,
+      storagePath: m['storage_path'] as String, // Add from map
     );
   }
 }
@@ -847,37 +1087,106 @@ class _EmptyState extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final screenWidth = MediaQuery.of(context).size.width;
+
     return Center(
       child: Padding(
-        padding: const EdgeInsets.all(24),
+        padding: EdgeInsets.all(screenWidth * 0.06), // 6% of width
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
-            const Icon(Icons.storage_rounded, size: 48, color: Colors.blueGrey),
-            const SizedBox(height: 10),
-            const Text(
+            Icon(
+              Icons.storage_rounded,
+              size: screenWidth * 0.12, // 12% of width
+              color: Colors.blueGrey,
+            ),
+            SizedBox(height: screenWidth * 0.025), // 2.5% of width
+            Text(
               'No quiz categories found',
               style: TextStyle(
                 fontFamily: 'Poppins',
                 fontWeight: FontWeight.w700,
-                fontSize: 18,
+                fontSize: screenWidth < 600 ? 16 : 18, // Responsive font
               ),
             ),
             if (error != null) ...[
-              const SizedBox(height: 6),
+              SizedBox(height: screenWidth * 0.015), // 1.5% of width
               Text(
                 error!,
                 textAlign: TextAlign.center,
-                style: const TextStyle(fontFamily: 'Inter'),
+                style: TextStyle(
+                  fontFamily: 'Inter',
+                  fontSize: screenWidth < 600 ? 13 : 14, // Responsive font
+                ),
               ),
             ],
-            const SizedBox(height: 12),
+            SizedBox(height: screenWidth * 0.04), // 4% of width
             OutlinedButton(
               onPressed: onRetry,
-              child: const Text('Retry', style: TextStyle(fontFamily: 'Inter')),
+              style: OutlinedButton.styleFrom(
+                padding: EdgeInsets.symmetric(
+                  horizontal: screenWidth * 0.06, // 6% of width
+                  vertical: screenWidth * 0.015, // 1.5% of width
+                ),
+              ),
+              child: Text(
+                'Retry',
+                style: TextStyle(
+                  fontFamily: 'Inter',
+                  fontSize: screenWidth < 600 ? 14 : 16, // Responsive font
+                ),
+              ),
             ),
           ],
         ),
+      ),
+    );
+  }
+}
+
+// ---------- New Section Header Widget ----------
+
+class _SectionHeader extends StatelessWidget {
+  final String title;
+  final int count;
+
+  const _SectionHeader({Key? key, required this.title, required this.count})
+    : super(key: key);
+
+  @override
+  Widget build(BuildContext context) {
+    final screenWidth = MediaQuery.of(context).size.width;
+
+    return Container(
+      padding: EdgeInsets.symmetric(
+        horizontal: screenWidth * 0.03, // 3% of width
+        vertical: screenWidth * 0.02, // 2% of width
+      ),
+      decoration: BoxDecoration(
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: Colors.black12),
+      ),
+      child: Row(
+        children: [
+          Text(
+            title,
+            style: TextStyle(
+              fontFamily: 'Poppins',
+              fontWeight: FontWeight.w700,
+              fontSize: screenWidth < 600 ? 14 : 16, // Responsive font
+            ),
+          ),
+          const Spacer(),
+          Text(
+            '$count',
+            style: TextStyle(
+              fontFamily: 'Inter',
+              fontSize: screenWidth < 600 ? 12 : 14, // Responsive font
+              color: Colors.black54,
+            ),
+          ),
+        ],
       ),
     );
   }

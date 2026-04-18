@@ -3,6 +3,7 @@ import 'dart:async';
 import 'dart:io' show Platform;
 import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:flutter/material.dart';
+import 'package:supabase_flutter/supabase_flutter.dart'; // Add this import for Supabase instance
 
 // Inline PDFs (+ open externally)
 import 'package:syncfusion_flutter_pdfviewer/pdfviewer.dart';
@@ -14,6 +15,7 @@ import 'package:screen_capture_event/screen_capture_event.dart';
 import 'home_screen.dart';
 import 'package:career_roadmap/services/supabase_service.dart';
 import 'package:career_roadmap/services/quiz_security_service.dart';
+import 'package:career_roadmap/services/ai_quiz_analysis_service.dart'; // Add this import
 
 class Question {
   final String text;
@@ -129,7 +131,12 @@ class Question {
 
 class QuizScreen extends StatefulWidget {
   final String categoryId; // legacy or ABM/GAS/STEM/TECHPRO
-  const QuizScreen({Key? key, required this.categoryId}) : super(key: key);
+  final String storagePath; // Add this
+  const QuizScreen({
+    Key? key,
+    required this.categoryId,
+    required this.storagePath,
+  }) : super(key: key);
 
   @override
   State<QuizScreen> createState() => _QuizScreenState();
@@ -209,6 +216,9 @@ class _QuizScreenState extends State<QuizScreen> {
 
   // Cached messenger
   ScaffoldMessengerState? _scaffoldMessenger;
+
+  // Add this new variable
+  bool _moduleDialogShown = false;
 
   bool get _supportsScreenCapture =>
       !kIsWeb && (Platform.isAndroid || Platform.isIOS || Platform.isMacOS);
@@ -429,30 +439,32 @@ class _QuizScreenState extends State<QuizScreen> {
       }
 
       // Load ALL questions (no sampling)
-      final selected = await SupabaseService.fetchQuizWithTOS(
-        quizId: _programId,
-        bucket: 'quizzes',
-        totalOverride: 0, // <= 0 => ALL
-      );
+      // Load ALL questions using the exact storage_path
+      final selected = await SupabaseService.fetchQuizJsonByPath(
+        widget.storagePath,
+      ); // Use storagePath directly
       if (!mounted) return;
 
-      if (selected.isEmpty) {
-        throw Exception('Quiz is empty for $_programId');
+      if (selected == null || selected['questions'] == null) {
+        throw Exception('Quiz not found at ${widget.storagePath}');
       }
 
+      // Extract questions from the JSON
+      final questionsJson = selected['questions'] as List;
       _questions
         ..clear()
         ..addAll(
-          selected.map((e) => Question.fromJson(Map<String, dynamic>.from(e))),
+          questionsJson.map(
+            (e) => Question.fromJson(Map<String, dynamic>.from(e)),
+          ),
         );
       _qKeys
         ..clear()
         ..addAll(List.generate(_questions.length, (_) => GlobalKey()));
 
-      // Exact quiz_id from JSON (case preserved)
-      _quizIdRawFromJson = _extractQuizIdFromSelected(
-        selected.map((e) => Map<String, dynamic>.from(e)).toList(),
-      );
+      // Exact quiz_id from JSON (case preserved) - directly from the top-level Map
+      _quizIdRawFromJson =
+          (selected['quiz_id'] as String?) ?? (selected['quizId'] as String?);
 
       // --- Check latest attempt for this exact quiz_id ---
       final attempt = await SupabaseService.getLatestAttemptForQuiz(
@@ -492,6 +504,13 @@ class _QuizScreenState extends State<QuizScreen> {
                   ? Map<String, dynamic>.from(attempt['answers'] as Map)
                   : <String, dynamic>{};
           _hydrateAnswersFromAttempt(ansJson);
+          // NEW: Check for low score and offer module generation (only once per load)
+          if (!_moduleDialogShown && _scorePct < 70) {
+            _moduleDialogShown = true;
+            WidgetsBinding.instance.addPostFrameCallback((_) {
+              _showModuleOfferDialog();
+            });
+          }
         } else {
           // Awaiting review -> lock answering, show Awaiting screen
           _blocked = true;
@@ -842,6 +861,56 @@ class _QuizScreenState extends State<QuizScreen> {
     if (ok) {
       _prepareForExit();
       if (context.mounted) Navigator.pop(context);
+    }
+  }
+
+  // NEW: Helper to show module offer dialog
+  Future<void> _showModuleOfferDialog() async {
+    if (!mounted) return;
+    final generate = await showDialog<bool>(
+      context: context,
+      builder:
+          (_) => AlertDialog(
+            title: const Text('Improve Your Skills'),
+            content: Text(
+              'You scored $_scorePct% on this quiz, which is below passing. Want us to create a personalized module to help you review and improve?',
+            ),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(context, false),
+                child: const Text('No Thanks'),
+              ),
+              ElevatedButton(
+                onPressed: () => Navigator.pop(context, true),
+                child: const Text('Yes, Generate Module'),
+              ),
+            ],
+          ),
+    );
+    if (generate == true) {
+      // Trigger AI module generation
+      final userId = Supabase.instance.client.auth.currentUser?.id;
+      if (userId != null) {
+        final module = await AIQuizAnalysisService.analyzeAndGenerateModule(
+          userId,
+        );
+        if (module != null) {
+          if (!mounted) return;
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+              content: Text('Personalized module created: ${module['title']}'),
+            ),
+          );
+          // Optionally navigate to skills_screen.dart
+        } else {
+          if (!mounted) return;
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(
+              content: Text('Failed to generate module. Try again later.'),
+            ),
+          );
+        }
+      }
     }
   }
 

@@ -8,6 +8,7 @@ import 'profile_details_screen.dart';
 import 'package:career_roadmap/services/supabase_service.dart';
 import 'package:career_roadmap/routes/route_tracker.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
+import 'package:career_roadmap/services/module_service.dart'; // Added import
 
 // Import adaptive screens
 import 'adaptive_lesson_screen.dart';
@@ -23,7 +24,7 @@ class SkillsScreen extends StatefulWidget {
 class _SkillsScreenState extends State<SkillsScreen> {
   // ✅ Bucket names
   static const String _modulesBucket = 'skill-modules';
-  static const String _quizzesBucket = 'adaptive-quizzes';
+  static const String _quizzesBucket = 'quizzes';
 
   bool _isLoading = true;
   String? _strandOrCourse; // e.g., GAS, STEM, ABM, BSENTREP, etc.
@@ -217,34 +218,22 @@ class _SkillsScreenState extends State<SkillsScreen> {
   /// We ALWAYS seed using **basenames** (no folder) so later resolution can attach
   /// the correct folder path per user.
   Future<void> _seedFromStorageIfMissing({
-    required bool seedModulesIfEmpty,
+    required List<Map<String, dynamic>> currentSkills,
     required bool seedQuizzesIfEmpty,
   }) async {
-    // Build a folder search set: user variants + discovered top-level + root
-    final moduleFolders = <String>{
-      ..._pathVariants(_strandOrCourse).where((s) => s.isNotEmpty),
-      ...await _topLevelFolders(_modulesBucket),
-      '',
-    };
+    // MODULES: Always check and add missing course-specific modules
+    final moduleIds = await ModuleService.fetchModulesForUserCourse();
+    setState(() => _diagModuleFiles = moduleIds.length);
+    debugPrint('[seed] course-specific module IDs: $moduleIds');
 
-    // MODULES: collect flat *.json and nested <id>/module.json as <id>.json
-    final moduleNames = <String>{};
-    for (final folder in moduleFolders) {
-      final names = await _storageListNames(
-        bucket: _modulesBucket,
-        path: folder,
-      );
-      // flat json
-      moduleNames.addAll(names.where((n) => n.endsWith('.json')));
-      // nested module.json → record as <id>.json
-      for (final maybeDir in names.where((n) => !n.contains('.'))) {
-        final subNames = await _storageListNames(
-          bucket: _modulesBucket,
-          path: '$folder/$maybeDir',
-        );
-        if (subNames.contains('module.json')) {
-          moduleNames.add('$maybeDir.json');
-        }
+    for (final m in moduleIds) {
+      final existing = currentSkills.any((s) => s['module_id'] == m);
+      if (!existing) {
+        // Load module JSON to get total_lessons
+        final moduleData = await ModuleService.loadModuleByStrand(moduleId: m);
+        final totalLessons = moduleData?['total_lessons'] ?? 20;
+        await SupabaseService.updateSkillProgress(m, 0, totalLessons);
+        debugPrint('[seed] inserted missing module: $m');
       }
     }
 
@@ -267,30 +256,17 @@ class _SkillsScreenState extends State<SkillsScreen> {
     }
 
     // Convert to IDs: basename without .json
-    final moduleIds = moduleNames.map(_stripJson).toSet();
     final quizIds = quizNames.map(_stripJson).toSet();
 
-    setState(() {
-      _diagModuleFiles = moduleIds.length;
-      _diagQuizFiles = quizIds.length;
-    });
-
-    debugPrint('[seed] discovered module IDs (basenames): $moduleIds');
+    setState(() => _diagQuizFiles = quizIds.length);
     debugPrint('[seed] discovered quiz IDs (basenames): $quizIds');
-
-    if (seedModulesIfEmpty && moduleIds.isNotEmpty) {
-      for (final m in moduleIds.take(3)) {
-        await SupabaseService.updateSkillProgress(m, 0, 20);
-      }
-      debugPrint('[seed] inserted default module progress');
-    }
 
     if (seedQuizzesIfEmpty && quizIds.isNotEmpty) {
       int i = 0;
       for (final q in quizIds.take(3)) {
         await SupabaseService.updateQuizProgress(
           q,
-          status: i == 0 ? 'in_progress' : 'locked', // <-- change here
+          status: i == 0 ? 'in_progress' : 'locked',
         );
         i++;
       }
@@ -300,35 +276,62 @@ class _SkillsScreenState extends State<SkillsScreen> {
   Future<void> _loadProgress() async {
     setState(() => _isLoading = true);
 
-    // 1) Strand / course code (used for folder detection)
+    // 1) Get user's course
     _strandOrCourse = await SupabaseService.getUserStrandOrCourseCode();
-    debugPrint('[user] strandOrCourse=$_strandOrCourse');
+    debugPrint('[user] course: $_strandOrCourse');
 
-    // 2) current DB progress
-    final skills = await SupabaseService.getSkillProgress();
-    final quizzes = await SupabaseService.getQuizProgress();
-    debugPrint('[db] existing skills=$skills');
-    debugPrint('[db] existing quizzes=$quizzes');
+    // 2) Fetch all skills
+    final allSkills = await SupabaseService.getSkillProgress();
+    debugPrint('[db] all skills: $allSkills');
 
-    // 3) seed independently based on what's empty
+    // 3) Filter skills
+    final filteredSkills = <Map<String, dynamic>>[];
+    for (final s in allSkills) {
+      final moduleId = s['module_id'] as String?;
+      if (moduleId == null || _strandOrCourse == null) continue;
+      debugPrint(
+        '[filter check] moduleId: $moduleId, course: $_strandOrCourse',
+      );
+      if (await _isModuleForCourse(moduleId, _strandOrCourse!)) {
+        debugPrint('[filter] added $moduleId via storage check');
+        filteredSkills.add(s);
+      } else if (moduleId.startsWith('${_strandOrCourse}_')) {
+        debugPrint('[filter] added $moduleId via prefix check');
+        filteredSkills.add(s);
+      }
+    }
+    debugPrint('[filtered] skills for $_strandOrCourse: $filteredSkills');
+
+    // 4) Seed missing modules
     await _seedFromStorageIfMissing(
-      seedModulesIfEmpty: skills.isEmpty,
-      seedQuizzesIfEmpty: quizzes.isEmpty,
+      currentSkills: filteredSkills,
+      seedQuizzesIfEmpty: false, // Focus on modules first
     );
 
-    // 4) refresh from DB (in case we just seeded)
-    final skills2 =
-        skills.isEmpty ? await SupabaseService.getSkillProgress() : skills;
+    // 5) Refresh skills
+    final updatedSkills = await SupabaseService.getSkillProgress();
+    final finalFilteredSkills = <Map<String, dynamic>>[];
+    for (final s in updatedSkills) {
+      final moduleId = s['module_id'] as String?;
+      if (moduleId == null || _strandOrCourse == null) continue;
+      if (await _isModuleForCourse(moduleId, _strandOrCourse!) ||
+          moduleId.startsWith('${_strandOrCourse}_')) {
+        finalFilteredSkills.add(s);
+      }
+    }
+
+    // 6) Fetch quizzes (simplified)
+    final quizzes = await SupabaseService.getQuizProgress();
     final quizzes2 =
         quizzes.isEmpty ? await SupabaseService.getQuizProgress() : quizzes;
 
-    // 5) resolve storage paths (so Download/Start knows the folder)
+    // 7) Resolve paths
     _moduleStoragePath.clear();
-    for (final s in skills2) {
+    for (final s in finalFilteredSkills) {
       final id = (s['module_id'] ?? '').toString();
       final p = await _resolveStoragePath(
         bucket: _modulesBucket,
-        id: id, // <-- basename only
+        id: id,
         isModule: true,
       );
       if (p != null) _moduleStoragePath[id] = p;
@@ -339,29 +342,43 @@ class _SkillsScreenState extends State<SkillsScreen> {
       final id = (q['quiz_id'] ?? '').toString();
       final p = await _resolveStoragePath(
         bucket: _quizzesBucket,
-        id: id, // <-- basename only
+        id: id,
         isModule: false,
       );
       if (p != null) _quizStoragePath[id] = p;
     }
 
     setState(() {
-      _skills = skills2;
+      _skills = finalFilteredSkills;
       _quizzes = quizzes2;
       _isLoading = false;
     });
 
-    debugPrint('[progress] skills=$_skills');
-    debugPrint('[progress] quizzes=$_quizzes');
-    debugPrint('[paths] moduleStoragePath=$_moduleStoragePath');
-    debugPrint('[paths] quizStoragePath=$_quizStoragePath');
+    debugPrint('[final] skills: $_skills');
+    debugPrint('[final] quizzes: $_quizzes');
+  }
+
+  // Add this helper method to the class (outside _loadProgress)
+  Future<bool> _isModuleForCourse(String moduleId, String course) async {
+    final path = '$course/${moduleId}.json';
+    debugPrint('[storage check] trying path: $path');
+    try {
+      await Supabase.instance.client.storage
+          .from(_modulesBucket)
+          .download(path);
+      debugPrint('[storage check] success for $path');
+      return true;
+    } catch (e) {
+      debugPrint('[storage check] failed for $path: $e');
+      return false;
+    }
   }
 
   Future<void> _forceScanAndReload() async {
     setState(() => _isLoading = true);
     // On manual sync: always try to seed quizzes; only seed modules if currently empty.
     await _seedFromStorageIfMissing(
-      seedModulesIfEmpty: _skills.isEmpty,
+      currentSkills: _skills,
       seedQuizzesIfEmpty: true,
     );
     await _loadProgress();
@@ -600,7 +617,7 @@ class _SkillsScreenState extends State<SkillsScreen> {
                 ],
               ),
             ),
-            if (!isLocked)
+            if (!isLocked) // <-- Use collection-if here
               ElevatedButton(
                 onPressed: () {
                   final effectiveId = _effectiveQuizId(quiz['quiz_id']);
@@ -609,8 +626,7 @@ class _SkillsScreenState extends State<SkillsScreen> {
                     MaterialPageRoute(
                       builder:
                           (_) => AdaptiveQuizScreen(
-                            quizId:
-                                effectiveId, // folder-aware (e.g. GAS/reading_writing_quiz_01)
+                            quizId: effectiveId,
                             title:
                                 (quiz['quiz_id'] as String)
                                     .replaceAll('_', ' ')
@@ -743,7 +759,7 @@ class _SkillsScreenState extends State<SkillsScreen> {
                           ),
                         ),
                         Text(
-                          "Adaptive learning${_strandOrCourse != null ? ' • ${_strandOrCourse!}' : ''}",
+                          "Learning Modules${_strandOrCourse != null ? ' • ${_strandOrCourse!}' : ''}",
                           style: const TextStyle(fontFamily: 'Inter'),
                         ),
                         const SizedBox(height: 16),
@@ -761,7 +777,7 @@ class _SkillsScreenState extends State<SkillsScreen> {
 
                         const SizedBox(height: 30),
                         const Text(
-                          "Adaptive Quizzes",
+                          "Quizzes",
                           style: TextStyle(
                             fontFamily: 'Poppins',
                             fontSize: 18,

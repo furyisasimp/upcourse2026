@@ -106,7 +106,7 @@ class ResourcesScreenState extends State<ResourcesScreen> {
             _ResourceCard(
               icon: Icons.explore,
               title: 'Exploration',
-              subtitle: 'Discover SHS pathways',
+              subtitle: 'Discover Pathways',
               colors: const [Color(0xFFA5D6A7), Color(0xFF66BB6A)],
               onTap: () {
                 Navigator.of(

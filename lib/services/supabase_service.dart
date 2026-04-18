@@ -61,7 +61,6 @@ void _d(String msg) {
 }
 
 /// Table of Specifications model for fixed-count quizzes (legacy/simple).
-/// Matches files like: quizzes/<QUIZ_ID>_tos.json with keys { easy, medium, hard, total }
 class QuizSpec {
   final int easy, medium, hard, total;
 
@@ -269,7 +268,7 @@ class SupabaseService {
         {
           'user_id': uid,
           'quiz_id': 'basic_programming_quiz',
-          'status': 'unlocked',
+          'status': 'locked',
           'score': null,
           'answers': null,
         },
@@ -765,7 +764,7 @@ class SupabaseService {
     }
   }
 
-  // ---------- USERS ----------
+  // USER PROFILE FETCHER FOR VIEWING PROFILE //
   static Future<Map<String, dynamic>?> getMyProfile() async {
     final uid = authUserId;
     if (uid == null) return null;
@@ -775,7 +774,7 @@ class SupabaseService {
             .from('users')
             .select(
               'first_name,middle_name,last_name,grade_level,profile_picture,'
-              'strand,course,track_id,course_id,section,' // ⬅️ added section
+              'strand,course,track_id,course_id,section,course_code,' // Added course_code
               'tracks:track_id(track_name),'
               'courses:course_id(name)',
             )
@@ -807,8 +806,13 @@ class SupabaseService {
     final courseFallback = (m['course']?.toString().trim() ?? '');
 
     m['track_label'] = (trackFromRel.isNotEmpty ? trackFromRel : trackFallback);
+
+    // Prioritize course_code (allocated course), then fall back to joined name or other fields
+    final allocatedCourse = (m['course_code']?.toString().trim() ?? '');
     m['course_label'] =
-        (courseFromRel.isNotEmpty ? courseFromRel : courseFallback);
+        (allocatedCourse.isNotEmpty
+            ? allocatedCourse
+            : (courseFromRel.isNotEmpty ? courseFromRel : courseFallback));
 
     for (final k in const [
       'first_name',
@@ -820,7 +824,8 @@ class SupabaseService {
       'course',
       'track_id',
       'course_id',
-      'section', // ⬅️ normalize section too
+      'section',
+      'course_code', // Added to normalization
       'track_label',
       'course_label',
     ]) {
@@ -1307,6 +1312,21 @@ class SupabaseService {
     });
   }
 
+  static Future<Map<String, dynamic>?> fetchQuizJsonByPath(
+    String filePath,
+  ) async {
+    try {
+      final response = await Supabase.instance.client.storage
+          .from('quizzes')
+          .download(filePath);
+      final jsonString = utf8.decode(response);
+      return jsonDecode(jsonString) as Map<String, dynamic>;
+    } catch (e) {
+      print('Error fetching JSON for $filePath: $e');
+      return null;
+    }
+  }
+
   static Future<Map<String, dynamic>?> getLatestProcessedResults() async {
     final uid = authUserId;
     if (uid == null) return null;
@@ -1538,6 +1558,166 @@ class SupabaseService {
     } catch (_) {
       return const [];
     }
+  }
+
+  // Get user's course code (e.g., BEEd, BSIT, BSHM)
+  static Future<String?> getUserCourseCode() async {
+    final user = Supabase.instance.client.auth.currentUser;
+    if (user == null) return null;
+
+    final response =
+        await Supabase.instance.client
+            .from('users')
+            .select('course_code')
+            .eq('supabase_id', user.id)
+            .maybeSingle();
+
+    return response?['course_code'] as String?;
+  }
+
+  static Future<Map<String, dynamic>> getUserRIASECResults() async {
+    final user = Supabase.instance.client.auth.currentUser;
+    if (user == null) {
+      print('🔴 No user found!');
+      return {};
+    }
+
+    print('🔵 Fetching RIASEC for user: ${user.id}');
+
+    var response =
+        await Supabase.instance.client
+            .from('riasec_results')
+            .select('r, i, a, s, e, c, taken_at')
+            .eq('user_id', user.id)
+            .order('taken_at', ascending: false)
+            .limit(1)
+            .maybeSingle();
+
+    print('🔵 RIASEC response: $response');
+    print('🔵 RIASEC response type: ${response.runtimeType}');
+
+    if (response == null) {
+      print('🔴 No RIASEC data found!');
+      return {};
+    }
+
+    // Handle if response is a List instead of Map
+    if (response is List) {
+      print('⚠️ Response is a List, taking first item');
+      if (response.isEmpty) {
+        return {};
+      }
+      response = response[0] as Map<String, dynamic>? ?? {};
+    }
+
+    if (response is! Map<String, dynamic>) {
+      print('⚠️ Response is not a Map, returning empty');
+      return {};
+    }
+
+    final result = {
+      'r': response['r'] as int? ?? 0,
+      'i': response['i'] as int? ?? 0,
+      'a': response['a'] as int? ?? 0,
+      's': response['s'] as int? ?? 0,
+      'e': response['e'] as int? ?? 0,
+      'c': response['c'] as int? ?? 0,
+      'taken_at': response['taken_at'] as String?,
+    };
+
+    print('🟢 RIASEC result: $result');
+    print('🟢 RIASEC result type: ${result.runtimeType}');
+
+    return result;
+  }
+
+  static Future<Map<String, dynamic>> getUserNCAEResults() async {
+    final user = Supabase.instance.client.auth.currentUser;
+    if (user == null) {
+      print('🔴 No user found!');
+      return {};
+    }
+
+    print('🔵 Fetching NCAE for user: ${user.id}');
+
+    var response =
+        await Supabase.instance.client
+            .from('questionnaire_results')
+            .select('results, timestamp')
+            .eq('user_id', user.id)
+            .order('created_at', ascending: false)
+            .limit(1)
+            .maybeSingle();
+
+    print('🔵 NCAE response: $response');
+    print('🔵 NCAE response type: ${response.runtimeType}');
+
+    if (response == null) {
+      print('🔴 No NCAE data found!');
+      return {};
+    }
+
+    // Handle if response is a List instead of Map
+    if (response is List) {
+      print('⚠️ Response is a List, taking first item');
+      if (response.isEmpty) {
+        return {};
+      }
+      response = response[0] as Map<String, dynamic>? ?? {};
+    }
+
+    if (response is! Map<String, dynamic>) {
+      print('⚠️ Response is not a Map, returning empty');
+      return {};
+    }
+
+    // The results column is a List, not a Map!
+    final resultsList = response['results'] as List<dynamic>? ?? [];
+    print('🔵 NCAE resultsList: $resultsList');
+    print('🔵 NCAE resultsList type: ${resultsList.runtimeType}');
+
+    // Convert List to Map for easier processing
+    Map<String, dynamic> resultsMap = {};
+    for (final item in resultsList) {
+      final mapItem = item as Map<String, dynamic>;
+      final category = mapItem['category'] as String?;
+      final score = mapItem['score'] as int? ?? 0;
+      if (category != null) {
+        resultsMap[category] = score;
+      }
+    }
+
+    final result = {
+      'results': resultsMap,
+      'timestamp': response['timestamp'] as String?,
+    };
+
+    print('🟢 NCAE result: $result');
+    print('🟢 NCAE result type: ${result.runtimeType}');
+
+    return result;
+  }
+
+  // Get user's latest questionnaire responses (for NCAE details)
+  static Future<Map<String, dynamic>> getUserQuestionnaireResponses() async {
+    final user = Supabase.instance.client.auth.currentUser;
+    if (user == null) return {};
+
+    final response =
+        await Supabase.instance.client
+            .from('questionnaire_responses')
+            .select('answers, timestamp')
+            .eq('user_id', user.id)
+            .order('created_at', ascending: false)
+            .limit(1)
+            .maybeSingle();
+
+    if (response == null) return {};
+
+    return {
+      'answers': response['answers'] as Map<String, dynamic>?,
+      'timestamp': response['timestamp'] as String?,
+    };
   }
 
   static Future<List<Map<String, dynamic>>> loadSkillModule(
@@ -2482,8 +2662,16 @@ class SupabaseService {
   }
 
   static Future<Map<String, dynamic>?> previewRecommendation() async {
-    final list = await topRecommendations(n: 1);
-    return list.isEmpty ? null : list.first;
+    final result = await previewLearningPath();
+    // Convert TABLE result to map for compatibility
+    if (result != null) {
+      return {
+        'course_name': result['course_name'],
+        'top_riasec': result['top_riasec'],
+        'rationale': result['rationale'],
+      };
+    }
+    return null;
   }
 
   static Future<Map<String, dynamic>?> previewLearningPath() async {
@@ -2712,41 +2900,37 @@ class SupabaseService {
     final uid = authUserId;
     if (uid == null) return null;
 
-    // Prefer explicit track fields (since your UI stores TECHPRO), then strand, then course.
-    final probes = <List<String>>[
-      ['track_code'],
-      ['track_id'], // might be a UUID → resolve below
-      ['strand_code', 'course_code'],
-      ['strand_id', 'course_id'],
-      ['strand', 'course'],
-      ['shs_strand_code', 'course_code'],
-      ['shs_strand', 'course_code'],
-    ];
+    try {
+      // First, try the new course_code field in users (prioritize if available)
+      final userRow =
+          await supa
+              .from('users')
+              .select('course_code, course_id')
+              .eq('supabase_id', uid)
+              .maybeSingle();
 
-    for (final cols in probes) {
-      try {
-        final row =
-            await supa
-                .from('users')
-                .select(cols.join(','))
-                .eq('supabase_id', uid)
-                .maybeSingle();
-        if (row == null) continue;
-
-        for (final c in cols) {
-          final v = row[c];
-          if (v == null) continue;
-
-          if (c == 'track_id') {
-            final resolved = await _resolveTrackCode(v);
-            if (resolved != null && resolved.isNotEmpty) return resolved;
-          }
-
-          if (v is String && v.trim().isNotEmpty) return v.trim();
-        }
-      } catch (_) {
-        /* keep probing */
+      final courseCode = userRow?['course_code'] as String?;
+      if (courseCode != null && courseCode.trim().isNotEmpty) {
+        return courseCode.trim(); // Use new field if set
       }
+
+      // Fallback: Resolve course_id to name from courses table (existing logic)
+      final courseId = userRow?['course_id'] as String?;
+      if (courseId == null) return null;
+
+      final courseRow =
+          await supa
+              .from('courses')
+              .select('name')
+              .eq('course_id', courseId)
+              .maybeSingle();
+
+      final courseName = courseRow?['name'] as String?;
+      if (courseName != null && courseName.trim().isNotEmpty) {
+        return courseName.trim();
+      }
+    } catch (e) {
+      print('[SupabaseService] Error fetching course code: $e');
     }
     return null;
   }
